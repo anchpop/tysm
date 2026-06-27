@@ -68,6 +68,49 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         cached_input: None,
         output: 4.0,
     },
+    // Anthropic (new models, copied from https://www.anthropic.com/pricing on 2026-06-24)
+    ModelCost {
+        name: "claude-fable-5",
+        input: 10.0,
+        cached_input: None,
+        output: 50.0,
+    },
+    ModelCost {
+        name: "claude-mythos-5",
+        input: 10.0,
+        cached_input: None,
+        output: 50.0,
+    },
+    ModelCost {
+        name: "claude-opus-4-8",
+        input: 5.0,
+        cached_input: None,
+        output: 25.0,
+    },
+    ModelCost {
+        name: "claude-opus-4-7",
+        input: 5.0,
+        cached_input: None,
+        output: 25.0,
+    },
+    ModelCost {
+        name: "claude-opus-4-6",
+        input: 5.0,
+        cached_input: None,
+        output: 25.0,
+    },
+    ModelCost {
+        name: "claude-sonnet-4-6",
+        input: 3.0,
+        cached_input: None,
+        output: 15.0,
+    },
+    ModelCost {
+        name: "claude-haiku-4-5",
+        input: 1.0,
+        cached_input: None,
+        output: 5.0,
+    },
     // OpenAI
     // Copied from https://platform.openai.com/docs/pricing on 2026-03-17
     ModelCost {
@@ -203,7 +246,55 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         cached_input: None,
         output: 1.50,
     },
+    ModelCost {
+        name: "gemini-3.5-flash",
+        input: 1.50,
+        cached_input: None,
+        output: 9.00,
+    },
+    ModelCost {
+        name: "gemini-2.5-pro",
+        input: 1.25,
+        cached_input: Some(0.13),
+        output: 10.00,
+    },
+    ModelCost {
+        name: "gemini-2.5-flash",
+        input: 0.30,
+        cached_input: Some(0.03),
+        output: 2.50,
+    },
+    ModelCost {
+        name: "gemini-2.5-flash-lite",
+        input: 0.10,
+        cached_input: Some(0.01),
+        output: 0.40,
+    },
+    ModelCost {
+        name: "gemini-2.0-flash",
+        input: 0.15,
+        cached_input: None,
+        output: 0.60,
+    },
+    ModelCost {
+        name: "gemini-2.0-flash-lite",
+        input: 0.075,
+        cached_input: None,
+        output: 0.30,
+    },
     // GPT-5 models
+    ModelCost {
+        name: "gpt-5.5-pro",
+        input: 30.00,
+        cached_input: None,
+        output: 180.00,
+    },
+    ModelCost {
+        name: "gpt-5.5",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
     ModelCost {
         name: "gpt-5.4-pro",
         input: 30.00,
@@ -312,6 +403,12 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
 // Copied from https://platform.openai.com/docs/pricing on 2026-03-17
 pub(crate) const FLEX_PRICES: &[ModelCost] = &[
     ModelCost {
+        name: "gpt-5.5",
+        input: 2.50,
+        cached_input: Some(0.25),
+        output: 15.00,
+    },
+    ModelCost {
         name: "gpt-5.4",
         input: 1.25,
         cached_input: Some(0.13),
@@ -381,12 +478,20 @@ pub(crate) const FLEX_PRICES: &[ModelCost] = &[
 
 // Priority tier pricing (OpenAI)
 // Copied from https://platform.openai.com/docs/pricing on 2026-03-17
-pub(crate) const PRIORITY_PRICES: &[ModelCost] = &[ModelCost {
-    name: "gpt-5.4",
-    input: 5.00,
-    cached_input: Some(0.50),
-    output: 30.00,
-}];
+pub(crate) const PRIORITY_PRICES: &[ModelCost] = &[
+    ModelCost {
+        name: "gpt-5.5",
+        input: 12.50,
+        cached_input: Some(1.25),
+        output: 75.00,
+    },
+    ModelCost {
+        name: "gpt-5.4",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
+];
 
 fn lookup<'a>(table: &'a [ModelCost], model: &str) -> Option<&'a ModelCost> {
     table
