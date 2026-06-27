@@ -36,10 +36,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use futures::stream::{StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -47,6 +49,59 @@ use tokio::sync::{Mutex, OnceCell};
 use xxhash_rust::xxh3::xxh3_64;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Max objects transferred concurrently during a pull/push.
+const SYNC_CONCURRENCY: usize = 32;
+
+/// Retry a fallible S3 operation a few times with backoff on transient errors.
+async fn retry<T, F, Fut>(mut op: F) -> Result<T, CacheSyncError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, CacheSyncError>>,
+{
+    const BACKOFF_MS: [u64; 3] = [100, 400, 1200];
+    let mut attempt = 0;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < BACKOFF_MS.len() && is_retryable(&e) => {
+                log::debug!("tysm cache: transient error (retrying): {e}");
+                tokio::time::sleep(Duration::from_millis(BACKOFF_MS[attempt])).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether an error is worth retrying (network hiccups, throttling, 5xx).
+fn is_retryable(e: &CacheSyncError) -> bool {
+    match e {
+        CacheSyncError::Http(_) => true,
+        CacheSyncError::BadStatus { status, .. } => *status == 429 || *status >= 500,
+        _ => false,
+    }
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file, then rename over the
+/// destination (atomic on the same filesystem). Prevents readers from ever seeing a
+/// partially written cache file if the process is interrupted mid-write.
+async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    tokio::fs::create_dir_all(parent).await?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{name}.tmp.{}.{n}", std::process::id()));
+    if let Err(e) = tokio::fs::write(&tmp, bytes).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    tokio::fs::rename(&tmp, path).await
+}
 
 /// The bucket a client's cache is mirrored to. Created by
 /// [`with_cache_bucket`](crate::chat_completions::ChatClient::with_cache_bucket).
@@ -293,50 +348,58 @@ async fn pull(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, CacheS
         scan.files.iter().map(|f| (f.rel.as_str(), f)).collect();
 
     let remote_keys = list_objects(&client, &cfg, &bucket.bucket, prefix).await?;
-    let mut downloaded = 0;
 
-    for full_key in remote_keys {
-        let Some(rel) = strip_prefix(&full_key, prefix) else {
-            continue;
-        };
-        if is_control(rel) {
-            continue;
-        }
-        let strategy = settings.strategy_for(rel);
-        let local = local_by_rel.get(rel).copied();
+    // Download concurrently. Each task returns 1 if it transferred a file, else 0.
+    let (settings, local_by_rel, remote_content, cfg, client) =
+        (&settings, &local_by_rel, &remote_content, &cfg, &client);
+    let downloaded = futures::stream::iter(remote_keys)
+        .map(|full_key| async move {
+            let Some(rel) = strip_prefix(&full_key, prefix) else {
+                return Ok(0usize);
+            };
+            if is_control(rel) {
+                return Ok(0);
+            }
+            let strategy = settings.strategy_for(rel);
+            let local = local_by_rel.get(rel).copied();
 
-        if strategy == Strategy::Path {
-            if local.is_none() {
-                if let Some(bytes) = get_object(&client, &cfg, &bucket.bucket, &full_key).await? {
-                    write_cache_file(dir, rel, &bytes).await?;
-                    downloaded += 1;
+            if strategy == Strategy::Path {
+                if local.is_none() {
+                    if let Some(bytes) = get_object(client, cfg, &bucket.bucket, &full_key).await? {
+                        write_cache_file(dir, rel, &bytes).await?;
+                        return Ok(1);
+                    }
                 }
+                return Ok(0);
             }
-            continue;
-        }
 
-        // content / json_merge: compare content hashes; only transfer on a difference.
-        if local.is_some() && local.and_then(|f| f.content_hash) == remote_content.get(rel).copied()
-        {
-            continue;
-        }
-        let Some(remote_bytes) = get_object(&client, &cfg, &bucket.bucket, &full_key).await? else {
-            continue;
-        };
-        let to_write = match (strategy, local) {
-            (Strategy::JsonMerge, Some(f)) => {
-                let local_bytes = tokio::fs::read(&f.path).await?;
-                merge_json_maps(&remote_bytes, &local_bytes).unwrap_or_else(|| {
-                    log::warn!("tysm cache: {rel} is not a JSON object; using remote copy");
-                    remote_bytes
-                })
+            // content / json_merge: compare content hashes; only transfer on a difference.
+            if local.is_some()
+                && local.and_then(|f| f.content_hash) == remote_content.get(rel).copied()
+            {
+                return Ok(0);
             }
-            // Strategy::Content (remote wins on pull) or local missing: take remote as-is.
-            _ => remote_bytes,
-        };
-        write_cache_file(dir, rel, &to_write).await?;
-        downloaded += 1;
-    }
+            let Some(remote_bytes) = get_object(client, cfg, &bucket.bucket, &full_key).await?
+            else {
+                return Ok(0);
+            };
+            let to_write = match (strategy, local) {
+                (Strategy::JsonMerge, Some(f)) => {
+                    let local_bytes = tokio::fs::read(&f.path).await?;
+                    merge_json_maps(&remote_bytes, &local_bytes).unwrap_or_else(|| {
+                        log::warn!("tysm cache: {rel} is not a JSON object; using remote copy");
+                        remote_bytes
+                    })
+                }
+                // Strategy::Content (remote wins on pull) or local missing: take remote as-is.
+                _ => remote_bytes,
+            };
+            write_cache_file(dir, rel, &to_write).await?;
+            Ok::<usize, CacheSyncError>(1)
+        })
+        .buffer_unordered(SYNC_CONCURRENCY)
+        .try_fold(0usize, |acc, n| async move { Ok(acc + n) })
+        .await?;
 
     Ok(CacheSyncStats {
         downloaded,
@@ -372,88 +435,101 @@ async fn push(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, CacheS
         .map(String::from)
         .collect();
 
+    // What each file's upload task reports back.
+    struct Outcome {
+        uploaded: bool,
+        /// Content hash to record in the manifest (for non-`path` files).
+        content: Option<(String, u64)>,
+    }
+
+    // Upload concurrently.
+    let (remote_content_ref, remote_rel_ref, cfg_ref, client_ref) =
+        (&remote_content, &remote_rel, &cfg, &client);
+    let outcomes: Vec<Outcome> = futures::stream::iter(scan.files.iter())
+        .map(|f| async move {
+            let key = obj_key(prefix, &f.rel);
+            match f.strategy {
+                Strategy::Path => {
+                    if remote_rel_ref.contains(&f.rel) {
+                        return Ok(Outcome {
+                            uploaded: false,
+                            content: None,
+                        });
+                    }
+                    let bytes = tokio::fs::read(&f.path).await?;
+                    put_object(client_ref, cfg_ref, &bucket.bucket, &key, bytes).await?;
+                    Ok(Outcome {
+                        uploaded: true,
+                        content: None,
+                    })
+                }
+                Strategy::Content => {
+                    let uploaded = if remote_content_ref.get(&f.rel).copied() != f.content_hash {
+                        let bytes = tokio::fs::read(&f.path).await?;
+                        put_object(client_ref, cfg_ref, &bucket.bucket, &key, bytes).await?;
+                        true
+                    } else {
+                        false
+                    };
+                    Ok(Outcome {
+                        uploaded,
+                        content: f.content_hash.map(|h| (f.rel.clone(), h)),
+                    })
+                }
+                Strategy::JsonMerge => {
+                    // Already in sync: just keep tracking its hash.
+                    if remote_content_ref.get(&f.rel).copied() == f.content_hash {
+                        return Ok(Outcome {
+                            uploaded: false,
+                            content: f.content_hash.map(|h| (f.rel.clone(), h)),
+                        });
+                    }
+                    let local_bytes = tokio::fs::read(&f.path).await?;
+                    let (final_bytes, write_back) = if remote_rel_ref.contains(&f.rel) {
+                        match get_object(client_ref, cfg_ref, &bucket.bucket, &key).await? {
+                            Some(remote_bytes) => {
+                                match merge_json_maps(&remote_bytes, &local_bytes) {
+                                    // Union; write back locally so both sides converge.
+                                    Some(m) => (m, true),
+                                    None => {
+                                        log::warn!(
+                                        "tysm cache: {} is not a JSON object; uploading local copy",
+                                        f.rel
+                                    );
+                                        (local_bytes, false)
+                                    }
+                                }
+                            }
+                            None => (local_bytes, false),
+                        }
+                    } else {
+                        (local_bytes, false)
+                    };
+                    if write_back {
+                        atomic_write(&f.path, &final_bytes).await?;
+                    }
+                    let hash = xxh3_64(&final_bytes);
+                    put_object(client_ref, cfg_ref, &bucket.bucket, &key, final_bytes).await?;
+                    Ok::<Outcome, CacheSyncError>(Outcome {
+                        uploaded: true,
+                        content: Some((f.rel.clone(), hash)),
+                    })
+                }
+            }
+        })
+        .buffer_unordered(SYNC_CONCURRENCY)
+        .try_collect()
+        .await?;
+
     let mut uploaded = 0;
     // Seed with remote content hashes so content files we don't touch stay tracked.
     let mut stored_content: BTreeMap<String, u64> = remote_content.clone();
-
-    for f in &scan.files {
-        match f.strategy {
-            Strategy::Path => {
-                if !remote_rel.contains(&f.rel) {
-                    let bytes = tokio::fs::read(&f.path).await?;
-                    put_object(
-                        &client,
-                        &cfg,
-                        &bucket.bucket,
-                        &obj_key(prefix, &f.rel),
-                        bytes,
-                    )
-                    .await?;
-                    uploaded += 1;
-                }
-            }
-            Strategy::Content => {
-                if remote_content.get(&f.rel).copied() != f.content_hash {
-                    let bytes = tokio::fs::read(&f.path).await?;
-                    put_object(
-                        &client,
-                        &cfg,
-                        &bucket.bucket,
-                        &obj_key(prefix, &f.rel),
-                        bytes,
-                    )
-                    .await?;
-                    uploaded += 1;
-                }
-                if let Some(h) = f.content_hash {
-                    stored_content.insert(f.rel.clone(), h);
-                }
-            }
-            Strategy::JsonMerge => {
-                if remote_content.get(&f.rel).copied() == f.content_hash {
-                    if let Some(h) = f.content_hash {
-                        stored_content.insert(f.rel.clone(), h);
-                    }
-                    continue;
-                }
-                let local_bytes = tokio::fs::read(&f.path).await?;
-                let merged = if remote_rel.contains(&f.rel) {
-                    match get_object(&client, &cfg, &bucket.bucket, &obj_key(prefix, &f.rel))
-                        .await?
-                    {
-                        Some(remote_bytes) => merge_json_maps(&remote_bytes, &local_bytes)
-                            .map(|m| {
-                                // Also write the union back locally so both sides converge.
-                                (m, true)
-                            })
-                            .unwrap_or_else(|| {
-                                log::warn!(
-                                    "tysm cache: {} is not a JSON object; uploading local copy",
-                                    f.rel
-                                );
-                                (local_bytes.clone(), false)
-                            }),
-                        None => (local_bytes.clone(), false),
-                    }
-                } else {
-                    (local_bytes.clone(), false)
-                };
-                let (final_bytes, write_back) = merged;
-                if write_back {
-                    tokio::fs::write(&f.path, &final_bytes).await?;
-                }
-                let hash = xxh3_64(&final_bytes);
-                put_object(
-                    &client,
-                    &cfg,
-                    &bucket.bucket,
-                    &obj_key(prefix, &f.rel),
-                    final_bytes,
-                )
-                .await?;
-                uploaded += 1;
-                stored_content.insert(f.rel.clone(), hash);
-            }
+    for o in outcomes {
+        if o.uploaded {
+            uploaded += 1;
+        }
+        if let Some((k, v)) = o.content {
+            stored_content.insert(k, v);
         }
     }
 
@@ -610,13 +686,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 // Local cache directory helpers
 // ===================================================================================
 
-/// Write `bytes` to `<dir>/<rel>`, creating parent directories as needed.
+/// Write `bytes` to `<dir>/<rel>` atomically, creating parent directories as needed.
 async fn write_cache_file(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), std::io::Error> {
-    let dest = dir.join(rel);
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(&dest, bytes).await
+    atomic_write(&dir.join(rel), bytes).await
 }
 
 /// Walk `dir`, returning `(relative-key, absolute-path)` for every file. The relative key
@@ -833,16 +905,21 @@ async fn list_objects(
             query.push(("continuation-token", token));
         }
 
-        let (status, body) = cfg
-            .send(client, "GET", bucket, "", &query, Vec::new())
-            .await?;
-        if !status.is_success() {
-            return Err(CacheSyncError::BadStatus {
-                key: "?list".to_string(),
-                status: status.as_u16(),
-                body: truncate(&String::from_utf8_lossy(&body)),
-            });
-        }
+        let body = retry(|| async {
+            let (status, body) = cfg
+                .send(client, "GET", bucket, "", &query, Vec::new())
+                .await?;
+            if status.is_success() {
+                Ok(body)
+            } else {
+                Err(CacheSyncError::BadStatus {
+                    key: "?list".to_string(),
+                    status: status.as_u16(),
+                    body: truncate(&String::from_utf8_lossy(&body)),
+                })
+            }
+        })
+        .await?;
         let xml = String::from_utf8_lossy(&body);
         keys.extend(extract_tags(&xml, "Key"));
 
@@ -870,20 +947,23 @@ async fn get_object(
     bucket: &str,
     key: &str,
 ) -> Result<Option<Vec<u8>>, CacheSyncError> {
-    let (status, body) = cfg
-        .send(client, "GET", bucket, key, &[], Vec::new())
-        .await?;
-    if status.is_success() {
-        Ok(Some(body))
-    } else if status == reqwest::StatusCode::NOT_FOUND {
-        Ok(None)
-    } else {
-        Err(CacheSyncError::BadStatus {
-            key: key.to_string(),
-            status: status.as_u16(),
-            body: truncate(&String::from_utf8_lossy(&body)),
-        })
-    }
+    retry(|| async {
+        let (status, body) = cfg
+            .send(client, "GET", bucket, key, &[], Vec::new())
+            .await?;
+        if status.is_success() {
+            Ok(Some(body))
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(CacheSyncError::BadStatus {
+                key: key.to_string(),
+                status: status.as_u16(),
+                body: truncate(&String::from_utf8_lossy(&body)),
+            })
+        }
+    })
+    .await
 }
 
 async fn put_object(
@@ -893,16 +973,22 @@ async fn put_object(
     key: &str,
     body: Vec<u8>,
 ) -> Result<(), CacheSyncError> {
-    let (status, body_resp) = cfg.send(client, "PUT", bucket, key, &[], body).await?;
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(CacheSyncError::BadStatus {
-            key: key.to_string(),
-            status: status.as_u16(),
-            body: truncate(&String::from_utf8_lossy(&body_resp)),
-        })
-    }
+    retry(|| {
+        let body = body.clone();
+        async move {
+            let (status, resp) = cfg.send(client, "PUT", bucket, key, &[], body).await?;
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(CacheSyncError::BadStatus {
+                    key: key.to_string(),
+                    status: status.as_u16(),
+                    body: truncate(&String::from_utf8_lossy(&resp)),
+                })
+            }
+        }
+    })
+    .await
 }
 
 fn truncate(s: &str) -> String {
