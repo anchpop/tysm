@@ -28,6 +28,7 @@ The **Typed Chat Completions** feature is the most interesting part, so most of 
   - [Setup](#setup)
     - [Automatic Caching](#automatic-caching)
     - [Persistent Cache](#persistent-cache)
+    - [Syncing the cache to a bucket (Cloudflare R2 / S3)](#syncing-the-cache-to-a-bucket-cloudflare-r2--s3)
     - [Custom API URL](#custom-api-url)
       - ["I want to use Anthropic!"](#i-want-to-use-anthropic)
       - ["I want to use Gemini!"](#i-want-to-use-gemini)
@@ -144,6 +145,56 @@ fn main() {
 }
 ```
 
+### Syncing the cache to a bucket (Cloudflare R2 / S3)
+
+With the `cache-sync` feature you can back the on-disk cache onto an S3-compatible
+bucket (e.g. Cloudflare R2). On the first request the local cache directory is warmed
+from the bucket; call `flush_cache()` at the end of your run to upload new entries back.
+This lets many machines (or CI jobs) share a warm cache without committing it to git.
+
+```toml
+[dependencies]
+tysm = { version = "0.19", features = ["cache-sync"] }
+```
+
+```rust
+use tysm::chat_completions::ChatClient;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = ChatClient::from_env("gpt-4o")?
+        .with_cache_directory("./cache")
+        .with_cache_bucket("my-cache-bucket");
+        // .with_cache_bucket_prefix("project-a")  // optional key prefix
+
+    #[derive(tysm::Deserialize, tysm::JsonSchema)]
+    struct Name { first: String, last: String }
+
+    // First request transparently warms ./cache from the bucket (once per process,
+    // even if multiple clients share the directory).
+    let _name: Name = client.chat("Who was the first US president?").await?;
+
+    // Upload any new cache entries back to the bucket.
+    client.flush_cache().await?;
+    Ok(())
+}
+```
+
+Credentials are read from the environment (the bucket name stays in code):
+
+| Variable | Purpose |
+| --- | --- |
+| `R2_ACCOUNT_ID` | Cloudflare account id (used to build the endpoint), **or** set `R2_ENDPOINT` directly |
+| `R2_ACCESS_KEY_ID` | S3 access key id (falls back to `AWS_ACCESS_KEY_ID`) |
+| `R2_SECRET_ACCESS_KEY` | S3 secret key (falls back to `AWS_SECRET_ACCESS_KEY`) |
+
+How it works: cache files are content-addressed, so the **set of file paths** identifies
+the cache. A commutative fingerprint (the wrapping sum of the path hashes) is stored in
+the bucket as a small `_fingerprint` object; when the local fingerprint already matches,
+both pull and push skip the LIST/transfer entirely. The pull is best-effort — if it
+fails (e.g. missing credentials) it logs a warning and serves from a cold cache. The
+same API is available on `EmbeddingsClient`. Don't enable `cache-sync` for WASM targets.
+
 ### Custom API URL
 
 Sometimes people want to use a different completions API. For example, I maintain a wrapper around OpenAI's API that adds a global cache. To switch the URL, just do this:
@@ -200,7 +251,8 @@ let client = ChatClient::new(api_key, "llama2").with_url("httphttp://localhost:1
 
 The following feature flags are available:
 
-1. `dotenvy` - (enabled by default) Enables automatic loading of environment variables from a `.env` file. 
+1. `dotenvy` - (enabled by default) Enables automatic loading of environment variables from a `.env` file.
+2. `cache-sync` - (off by default) Mirror the on-disk cache to an S3-compatible bucket such as Cloudflare R2. See [Syncing the cache to a bucket](#syncing-the-cache-to-a-bucket-cloudflare-r2--s3). Not WASM-compatible.
 
 Example of disabling dotenvy:
 ```toml

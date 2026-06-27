@@ -45,6 +45,8 @@
 #![deny(clippy::string_slice)]
 
 pub mod batch;
+#[cfg(feature = "cache-sync")]
+pub mod cache_sync;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod files;

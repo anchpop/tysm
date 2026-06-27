@@ -103,6 +103,11 @@ pub struct EmbeddingsClient {
 
     /// Shared HTTP client with connection pooling
     pub http_client: Client,
+
+    /// The S3-compatible bucket (e.g. Cloudflare R2) to mirror the on-disk cache to.
+    /// See [`ChatClient::with_cache_bucket`](crate::chat_completions::ChatClient::with_cache_bucket).
+    #[cfg(feature = "cache-sync")]
+    pub cache_bucket: Option<crate::cache_sync::CacheBucket>,
 }
 
 /// Errors that can occur when interacting with the ChatGPT API.
@@ -168,6 +173,54 @@ impl EmbeddingsClient {
             extra_body: None,
             semaphore: Semaphore::new(100),
             http_client: crate::utils::pooled_client(),
+            #[cfg(feature = "cache-sync")]
+            cache_bucket: None,
+        }
+    }
+
+    /// Mirror the on-disk cache to an S3-compatible bucket (e.g. Cloudflare R2).
+    ///
+    /// Requires [`Self::with_cache_directory`]. Behaves like
+    /// [`ChatClient::with_cache_bucket`](crate::chat_completions::ChatClient::with_cache_bucket):
+    /// the cache is warmed from the bucket on first use and pushed back via
+    /// [`Self::flush_cache`].
+    #[cfg(feature = "cache-sync")]
+    pub fn with_cache_bucket(mut self, bucket: impl Into<String>) -> Self {
+        if self.cache_directory.is_none() {
+            panic!("with_cache_bucket requires with_cache_directory to be set first");
+        }
+        self.cache_bucket = Some(crate::cache_sync::CacheBucket::new(bucket));
+        self
+    }
+
+    /// Set an optional key prefix within the cache bucket (default: empty).
+    #[cfg(feature = "cache-sync")]
+    pub fn with_cache_bucket_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into().trim_matches('/').to_string();
+        match &mut self.cache_bucket {
+            Some(bucket) => bucket.prefix = prefix,
+            None => panic!("with_cache_bucket_prefix requires with_cache_bucket to be set first"),
+        }
+        self
+    }
+
+    /// Warm the local cache directory from the configured bucket (best-effort, once per
+    /// process). Called automatically before embedding requests.
+    #[cfg(feature = "cache-sync")]
+    pub async fn ensure_cache_warmed(&self) {
+        if let (Some(dir), Some(bucket)) = (&self.cache_directory, &self.cache_bucket) {
+            crate::cache_sync::ensure_pulled(dir, bucket).await;
+        }
+    }
+
+    /// Upload any local cache entries not yet in the bucket. Call once at the end of a run.
+    #[cfg(feature = "cache-sync")]
+    pub async fn flush_cache(
+        &self,
+    ) -> Result<crate::cache_sync::CacheSyncStats, crate::cache_sync::CacheSyncError> {
+        match (&self.cache_directory, &self.cache_bucket) {
+            (Some(dir), Some(bucket)) => crate::cache_sync::flush(dir, bucket).await,
+            _ => Ok(crate::cache_sync::CacheSyncStats::default()),
         }
     }
 
@@ -300,6 +353,9 @@ impl EmbeddingsClient {
         documents: &'a [T],
         f: impl Fn(&'a T) -> S,
     ) -> Result<Vec<(&'a T, Vector)>, EmbeddingsError> {
+        #[cfg(feature = "cache-sync")]
+        self.ensure_cache_warmed().await;
+
         let documents_len = documents.len();
         let mut all_embeddings = Vec::with_capacity(documents_len);
 

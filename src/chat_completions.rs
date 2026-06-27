@@ -74,6 +74,12 @@ pub struct ChatClient {
     /// If true, all uncached requests will fail with [`ChatError::CacheMiss`] instead of
     /// hitting the API. Useful for testing or offline usage.
     pub cached_only: bool,
+
+    /// The S3-compatible bucket (e.g. Cloudflare R2) to mirror the on-disk cache to.
+    /// When set together with [`cache_directory`](Self::cache_directory), the cache is
+    /// pulled from the bucket on first use and pushed back via [`Self::flush_cache`].
+    #[cfg(feature = "cache-sync")]
+    pub cache_bucket: Option<crate::cache_sync::CacheBucket>,
 }
 
 /// The role of a message.
@@ -736,6 +742,8 @@ impl ChatClient {
             semaphore: Semaphore::new(100),
             http_client: crate::utils::pooled_client(),
             cached_only: false,
+            #[cfg(feature = "cache-sync")]
+            cache_bucket: None,
         }
     }
 
@@ -769,6 +777,64 @@ impl ChatClient {
 
         self.backup_cache_directory = Some(backup_cache_directory);
         self
+    }
+
+    /// Mirror the on-disk cache to an S3-compatible bucket (e.g. Cloudflare R2).
+    ///
+    /// Requires [`Self::with_cache_directory`] to have been set. On the first request the
+    /// local cache directory is warmed from the bucket (once per process, even across
+    /// clients sharing the directory); call [`Self::flush_cache`] at the end of your run
+    /// to upload new entries back.
+    ///
+    /// Credentials are read from the environment: `R2_ACCOUNT_ID` (or `R2_ENDPOINT`),
+    /// `R2_ACCESS_KEY_ID` (or `AWS_ACCESS_KEY_ID`), and `R2_SECRET_ACCESS_KEY` (or
+    /// `AWS_SECRET_ACCESS_KEY`).
+    #[cfg(feature = "cache-sync")]
+    pub fn with_cache_bucket(mut self, bucket: impl Into<String>) -> Self {
+        if self.cache_directory.is_none() {
+            panic!("with_cache_bucket requires with_cache_directory to be set first");
+        }
+        self.cache_bucket = Some(crate::cache_sync::CacheBucket::new(bucket));
+        self
+    }
+
+    /// Set an optional key prefix within the cache bucket (default: empty).
+    ///
+    /// Panics if [`Self::with_cache_bucket`] has not been called first.
+    #[cfg(feature = "cache-sync")]
+    pub fn with_cache_bucket_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        let prefix = prefix.trim_matches('/').to_string();
+        match &mut self.cache_bucket {
+            Some(bucket) => bucket.prefix = prefix,
+            None => panic!("with_cache_bucket_prefix requires with_cache_bucket to be set first"),
+        }
+        self
+    }
+
+    /// Warm the local cache directory from the configured bucket. Best-effort and runs at
+    /// most once per process per (bucket, directory). Called automatically before each
+    /// request; exposed for callers that want to warm the cache eagerly.
+    #[cfg(feature = "cache-sync")]
+    pub async fn ensure_cache_warmed(&self) {
+        if let (Some(dir), Some(bucket)) = (&self.cache_directory, &self.cache_bucket) {
+            crate::cache_sync::ensure_pulled(dir, bucket).await;
+        }
+    }
+
+    /// Upload any local cache entries not yet in the bucket. Call this once at the end of
+    /// a run. Idempotent and deduplicated across clients sharing a cache directory.
+    ///
+    /// Returns the number of objects transferred. No-op (returns `Ok` with zeroed stats)
+    /// if no cache bucket or directory is configured.
+    #[cfg(feature = "cache-sync")]
+    pub async fn flush_cache(
+        &self,
+    ) -> Result<crate::cache_sync::CacheSyncStats, crate::cache_sync::CacheSyncError> {
+        match (&self.cache_directory, &self.cache_bucket) {
+            (Some(dir), Some(bucket)) => crate::cache_sync::flush(dir, bucket).await,
+            _ => Ok(crate::cache_sync::CacheSyncStats::default()),
+        }
     }
 
     /// Set the service tier for requests (e.g., "flex")
@@ -1017,6 +1083,9 @@ impl ChatClient {
         response_format: ResponseFormat,
         map_response: impl Fn(String) -> Result<T, ChatError>,
     ) -> Result<T, ChatError> {
+        #[cfg(feature = "cache-sync")]
+        self.ensure_cache_warmed().await;
+
         let chat_request = ChatRequest {
             model: self.model.clone(),
             messages,
