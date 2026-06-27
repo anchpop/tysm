@@ -45,6 +45,7 @@
 #![deny(clippy::string_slice)]
 
 pub mod batch;
+pub mod cache;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod files;

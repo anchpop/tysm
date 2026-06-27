@@ -441,7 +441,7 @@ impl EmbeddingsClient {
 
         // Read the compressed data from disk, checking sharded then flat paths,
         // then falling back to backup cache directory
-        let compressed_data = match crate::utils::read_from_cache_dir(cache_directory, &cache_key)
+        let compressed_data = match crate::cache::read_from_cache_dir(cache_directory, &cache_key)
             .await
         {
             Some(data) => data,
@@ -450,11 +450,11 @@ impl EmbeddingsClient {
                 if let Some(backup_cache_directory) = &self.backup_cache_directory {
                     if backup_cache_directory.exists() {
                         if let Some(data) =
-                            crate::utils::read_from_cache_dir(backup_cache_directory, &cache_key)
+                            crate::cache::read_from_cache_dir(backup_cache_directory, &cache_key)
                                 .await
                         {
                             // Found in backup cache, copy it to main cache (sharded)
-                            let _ = crate::utils::write_to_cache_dir(
+                            let _ = crate::cache::write_to_cache_dir(
                                 cache_directory,
                                 &cache_key,
                                 &data,
@@ -513,7 +513,7 @@ impl EmbeddingsClient {
         if let Some(cache_directory) = &self.cache_directory {
             // Compress the response with zstd before writing to disk
             let compressed = zstd::encode_all(response.as_bytes(), 3)?;
-            crate::utils::write_to_cache_dir(cache_directory, &cache_key, &compressed).await?;
+            crate::cache::write_to_cache_dir(cache_directory, &cache_key, &compressed).await?;
         }
 
         self.lru

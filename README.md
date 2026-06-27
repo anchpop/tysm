@@ -139,10 +139,17 @@ fn main() {
     }
 
     let _name: Name = CLIENT.chat("Who was the first US president?").await.unwrap();
-    // The response will be written to a file in ./cache
+    // The response is appended to a shard file in ./cache
     // Subsequent calls with this exact request will use the cached value instead of hitting the API. 
 }
 ```
+
+The cache is stored as a few big append-only **record-log** shard files (`000.kv` …
+`999.kv`) rather than one file per entry, which keeps the directory to ~1000 files and
+makes it cheap to mirror to object storage (e.g. with [`osmo`](https://github.com/anchpop/osmo),
+whose `records` strategy understands the same format and merges shards losslessly across
+machines). An older `dir/<shard>/<key>` cache is migrated automatically the first time each
+shard is touched; call [`tysm::cache::migrate`] to fold the whole directory up-front.
 
 ### Custom API URL
 
@@ -200,7 +207,7 @@ let client = ChatClient::new(api_key, "llama2").with_url("httphttp://localhost:1
 
 The following feature flags are available:
 
-1. `dotenvy` - (enabled by default) Enables automatic loading of environment variables from a `.env` file. 
+1. `dotenvy` - (enabled by default) Enables automatic loading of environment variables from a `.env` file.
 
 Example of disabling dotenvy:
 ```toml
