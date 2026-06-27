@@ -101,6 +101,75 @@ async fn r2_round_trip() {
     );
 }
 
+/// Exercises the `json_merge` strategy: a mutable JSON-map file declared in
+/// `.tysm-sync.json` is unioned (not clobbered) across machines, and the settings file
+/// itself propagates through the bucket.
+#[tokio::test]
+#[ignore = "requires live R2 credentials + TYSM_TEST_BUCKET"]
+async fn r2_json_merge_unions_entries() {
+    let Some(bucket_name) = env("TYSM_TEST_BUCKET") else {
+        eprintln!("skipping: TYSM_TEST_BUCKET not set");
+        return;
+    };
+    if env("R2_ACCESS_KEY_ID")
+        .or_else(|| env("AWS_ACCESS_KEY_ID"))
+        .is_none()
+    {
+        eprintln!("skipping: R2/AWS access key not set");
+        return;
+    }
+
+    let bucket = CacheBucket {
+        bucket: bucket_name,
+        prefix: unique_prefix(),
+    };
+    let settings = br#"{"files":[{"path":"shared/data.json","strategy":"json_merge"}]}"#;
+
+    // Machine A: declares the merge rule and pushes its entries.
+    let a = tempdir();
+    write_file(a.path(), ".tysm-sync.json", settings).await;
+    write_file(a.path(), "shared/data.json", br#"{"a":1,"common":"x"}"#).await;
+    flush(a.path(), &bucket).await.expect("push A");
+
+    // Machine B: has its own entries and NO settings file — it should inherit the rule
+    // from the bucket, then *merge* rather than clobber on pull.
+    let b = tempdir();
+    write_file(b.path(), "shared/data.json", br#"{"b":2,"common":"y"}"#).await;
+    ensure_pulled(b.path(), &bucket).await;
+
+    assert!(
+        b.path().join(".tysm-sync.json").exists(),
+        "settings should be inherited from the bucket"
+    );
+    let merged = tokio::fs::read_to_string(b.path().join("shared/data.json"))
+        .await
+        .expect("merged data.json");
+    assert!(
+        merged.contains("\"a\":1"),
+        "remote entry merged in: {merged}"
+    );
+    assert!(
+        merged.contains("\"b\":2"),
+        "local entry preserved: {merged}"
+    );
+    assert!(
+        merged.contains("\"common\":\"y\""),
+        "local value wins on collision: {merged}"
+    );
+
+    // Push B's union back, then a fresh machine C pulls the full union.
+    flush(b.path(), &bucket).await.expect("push B");
+    let c = tempdir();
+    ensure_pulled(c.path(), &bucket).await;
+    let c_data = tokio::fs::read_to_string(c.path().join("shared/data.json"))
+        .await
+        .expect("pulled union");
+    assert!(
+        c_data.contains("\"a\":1") && c_data.contains("\"b\":2"),
+        "C should hold the union of both machines: {c_data}"
+    );
+}
+
 /// Minimal unique temp dir without pulling in the `tempfile` crate.
 fn tempdir() -> TempDir {
     let nanos = SystemTime::now()

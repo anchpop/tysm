@@ -189,11 +189,36 @@ Credentials are read from the environment (the bucket name stays in code):
 | `R2_SECRET_ACCESS_KEY` | S3 secret key (falls back to `AWS_SECRET_ACCESS_KEY`) |
 
 How it works: cache files are content-addressed, so the **set of file paths** identifies
-the cache. A commutative fingerprint (the wrapping sum of the path hashes) is stored in
-the bucket as a small `_fingerprint` object; when the local fingerprint already matches,
-both pull and push skip the LIST/transfer entirely. The pull is best-effort — if it
-fails (e.g. missing credentials) it logs a warning and serves from a cold cache. The
-same API is available on `EmbeddingsClient`. Don't enable `cache-sync` for WASM targets.
+the cache. A commutative fingerprint (the wrapping sum of per-file hashes) plus per-file
+content hashes are stored in the bucket as a small `_tysm_manifest.json` object; when the
+local fingerprint already matches, both pull and push skip the LIST/transfer entirely. The
+pull is best-effort — if it fails (e.g. missing credentials) it logs a warning and serves
+from a cold cache. The same API is available on `EmbeddingsClient`. Don't enable
+`cache-sync` for WASM targets.
+
+#### Mutable files (e.g. a shared translation cache)
+
+The default assumes every file is immutable/content-addressed (true for tysm's own
+responses). If your cache directory also contains a **mutable** file — say a single JSON
+file mapping requests to responses that grows over time — drop a `.tysm-sync.json` at the
+cache-dir root to give it a different strategy. It's synced to the bucket too, so every
+machine inherits the rule automatically:
+
+```json
+{
+  "files": [
+    { "path": "google_translate/master_cache.json", "strategy": "json_merge" }
+  ]
+}
+```
+
+Strategies (`path` glob supports `*` and `?`):
+
+- **`path`** (default) — immutable; identified by path; transferred once.
+- **`content`** — mutable; identified by content hash; last-writer-wins (remote wins on
+  pull, local wins on push).
+- **`json_merge`** — mutable JSON object; reconciled by **unioning top-level keys** (local
+  wins on collisions), so no entries are ever lost even when two machines both append.
 
 ### Custom API URL
 

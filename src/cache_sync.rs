@@ -10,22 +10,41 @@
 //! - **push** ([`ChatClient::flush_cache`](crate::chat_completions::ChatClient::flush_cache),
 //!   explicit): upload any local files not yet in the bucket.
 //!
-//! A commutative fingerprint (the wrapping sum of `xxh3` hashes of the relative paths)
-//! is stored in the bucket as a small `_fingerprint` object. When the local fingerprint
-//! already matches the remote one, both pull and push skip the expensive LIST/transfer.
+//! A commutative fingerprint (the wrapping sum of per-file `xxh3` hashes) plus per-file
+//! content hashes are stored in the bucket as a small `_tysm_manifest.json` object. When
+//! the local fingerprint already matches the remote one, both pull and push skip the
+//! expensive LIST/transfer.
+//!
+//! ## Per-file strategies
+//!
+//! By default a file is treated as immutable/content-addressed (its *path* identifies it).
+//! Mutable files can opt into a different strategy via a `.tysm-sync.json` config at the
+//! cache-dir root (synced to the bucket so every machine inherits it):
+//!
+//! ```json
+//! { "files": [ { "path": "google_translate/master_cache.json", "strategy": "json_merge" } ] }
+//! ```
+//!
+//! - `path` (default): immutable; fingerprinted by path; transferred once.
+//! - `content`: mutable; fingerprinted by content; last-writer-wins (remote wins on pull,
+//!   local wins on push).
+//! - `json_merge`: mutable JSON object; reconciled by unioning top-level keys, so entries
+//!   are never lost.
 //!
 //! Credentials come from the environment; the bucket name is configured in code via
 //! [`with_cache_bucket`](crate::chat_completions::ChatClient::with_cache_bucket).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, OnceCell};
+use xxhash_rust::xxh3::xxh3_64;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -142,7 +161,112 @@ pub async fn flush(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, C
 // Pull / push
 // ===================================================================================
 
-const FINGERPRINT_REL: &str = "_fingerprint";
+/// Config file at the cache-dir root that assigns non-default sync strategies to files.
+const SETTINGS_REL: &str = ".tysm-sync.json";
+/// Object holding the overall fingerprint plus per-file content hashes.
+const MANIFEST_REL: &str = "_tysm_manifest.json";
+/// Pre-manifest fingerprint object; recognized only so it's never treated as cache data.
+const LEGACY_FINGERPRINT_REL: &str = "_fingerprint";
+
+fn is_control(rel: &str) -> bool {
+    rel == SETTINGS_REL || rel == MANIFEST_REL || rel == LEGACY_FINGERPRINT_REL
+}
+
+/// How a given cache file is fingerprinted and reconciled during sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Strategy {
+    /// Default: file is immutable/content-addressed, so its *path* identifies it. Never
+    /// re-transferred once present on both sides. (No content read needed.)
+    #[default]
+    Path,
+    /// Mutable file: fingerprinted by whole-file content; last-writer-wins on transfer
+    /// (remote wins on pull, local wins on push).
+    Content,
+    /// Mutable JSON object: fingerprinted by content, but reconciled by *unioning* the
+    /// top-level keys of the local and remote maps, so no entries are ever lost.
+    JsonMerge,
+}
+
+/// Parsed `.tysm-sync.json`.
+#[derive(Debug, Default, Deserialize)]
+struct SyncSettings {
+    #[serde(default)]
+    files: Vec<FileRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FileRule {
+    /// Glob (supports `*` and `?`) matched against the relative cache path.
+    path: String,
+    #[serde(default)]
+    strategy: Strategy,
+}
+
+impl SyncSettings {
+    fn strategy_for(&self, rel: &str) -> Strategy {
+        self.files
+            .iter()
+            .find(|r| glob_match(&r.path, rel))
+            .map(|r| r.strategy)
+            .unwrap_or_default()
+    }
+}
+
+/// The bucket-side record: overall fingerprint (for the fast-path skip) plus the content
+/// hash of every non-`path` file (so pull/push can compare without downloading them).
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Manifest {
+    #[serde(default)]
+    overall: u64,
+    #[serde(default)]
+    content: BTreeMap<String, u64>,
+}
+
+struct ScannedFile {
+    rel: String,
+    path: PathBuf,
+    strategy: Strategy,
+    /// `xxh3` of the file contents; `None` for `Strategy::Path` (not read).
+    content_hash: Option<u64>,
+}
+
+struct LocalScan {
+    files: Vec<ScannedFile>,
+    /// Commutative fingerprint over all files (path hash, or path⊕content hash).
+    overall: u64,
+}
+
+/// The per-file contribution to the overall fingerprint.
+fn identity(rel: &str, content_hash: Option<u64>) -> u64 {
+    match content_hash {
+        Some(h) => xxh3_64(rel.as_bytes()) ^ h,
+        None => xxh3_64(rel.as_bytes()),
+    }
+}
+
+/// Walk the cache dir, classifying each file by strategy and hashing the contents of
+/// non-`path` files.
+async fn scan_local(dir: &Path, settings: &SyncSettings) -> Result<LocalScan, std::io::Error> {
+    let mut files = Vec::new();
+    let mut overall = 0u64;
+    for (rel, path) in list_cache_files(dir).await? {
+        let strategy = settings.strategy_for(&rel);
+        let content_hash = if strategy == Strategy::Path {
+            None
+        } else {
+            Some(xxh3_64(&tokio::fs::read(&path).await?))
+        };
+        overall = overall.wrapping_add(identity(&rel, content_hash));
+        files.push(ScannedFile {
+            rel,
+            path,
+            strategy,
+            content_hash,
+        });
+    }
+    Ok(LocalScan { files, overall })
+}
 
 async fn pull(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, CacheSyncError> {
     // Ensure the cache directory exists even if the bucket is empty or unreachable, so the
@@ -151,40 +275,67 @@ async fn pull(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, CacheS
 
     let cfg = R2Config::from_env()?;
     let client = crate::utils::pooled_client();
-
-    let local = list_cache_files(dir).await?;
-    let local_keys: HashSet<String> = local.iter().map(|(k, _)| k.clone()).collect();
-    let local_fp = fingerprint(&local_keys);
-
-    // Fast path: if the bucket's recorded fingerprint matches local, we're in sync.
-    if let Some(remote_fp) = get_fingerprint(&client, &cfg, bucket).await? {
-        if remote_fp == local_fp {
-            return Ok(CacheSyncStats {
-                skipped: true,
-                ..Default::default()
-            });
-        }
-    }
-
     let prefix = &bucket.prefix;
-    let remote_keys = list_objects(&client, &cfg, &bucket.bucket, prefix).await?;
 
+    let settings = load_settings(dir, &client, &cfg, bucket).await;
+    let scan = scan_local(dir, &settings).await?;
+    let manifest = get_manifest(&client, &cfg, bucket).await;
+
+    // Fast path: the bucket's recorded fingerprint matches local.
+    if manifest.as_ref().map(|m| m.overall) == Some(scan.overall) {
+        return Ok(CacheSyncStats {
+            skipped: true,
+            ..Default::default()
+        });
+    }
+    let remote_content = manifest.map(|m| m.content).unwrap_or_default();
+    let local_by_rel: HashMap<&str, &ScannedFile> =
+        scan.files.iter().map(|f| (f.rel.as_str(), f)).collect();
+
+    let remote_keys = list_objects(&client, &cfg, &bucket.bucket, prefix).await?;
     let mut downloaded = 0;
+
     for full_key in remote_keys {
         let Some(rel) = strip_prefix(&full_key, prefix) else {
             continue;
         };
-        if rel == FINGERPRINT_REL || local_keys.contains(rel) {
+        if is_control(rel) {
             continue;
         }
-        if let Some(bytes) = get_object(&client, &cfg, &bucket.bucket, &full_key).await? {
-            let dest = dir.join(rel);
-            if let Some(parent) = dest.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+        let strategy = settings.strategy_for(rel);
+        let local = local_by_rel.get(rel).copied();
+
+        if strategy == Strategy::Path {
+            if local.is_none() {
+                if let Some(bytes) = get_object(&client, &cfg, &bucket.bucket, &full_key).await? {
+                    write_cache_file(dir, rel, &bytes).await?;
+                    downloaded += 1;
+                }
             }
-            tokio::fs::write(&dest, &bytes).await?;
-            downloaded += 1;
+            continue;
         }
+
+        // content / json_merge: compare content hashes; only transfer on a difference.
+        if local.is_some() && local.and_then(|f| f.content_hash) == remote_content.get(rel).copied()
+        {
+            continue;
+        }
+        let Some(remote_bytes) = get_object(&client, &cfg, &bucket.bucket, &full_key).await? else {
+            continue;
+        };
+        let to_write = match (strategy, local) {
+            (Strategy::JsonMerge, Some(f)) => {
+                let local_bytes = tokio::fs::read(&f.path).await?;
+                merge_json_maps(&remote_bytes, &local_bytes).unwrap_or_else(|| {
+                    log::warn!("tysm cache: {rel} is not a JSON object; using remote copy");
+                    remote_bytes
+                })
+            }
+            // Strategy::Content (remote wins on pull) or local missing: take remote as-is.
+            _ => remote_bytes,
+        };
+        write_cache_file(dir, rel, &to_write).await?;
+        downloaded += 1;
     }
 
     Ok(CacheSyncStats {
@@ -194,51 +345,146 @@ async fn pull(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, CacheS
 }
 
 async fn push(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, CacheSyncError> {
+    tokio::fs::create_dir_all(dir).await?;
+
     let cfg = R2Config::from_env()?;
     let client = crate::utils::pooled_client();
-
-    let local = list_cache_files(dir).await?;
-    let local_keys: HashSet<String> = local.iter().map(|(k, _)| k.clone()).collect();
-    let local_fp = fingerprint(&local_keys);
-
-    if let Some(remote_fp) = get_fingerprint(&client, &cfg, bucket).await? {
-        if remote_fp == local_fp {
-            return Ok(CacheSyncStats {
-                skipped: true,
-                ..Default::default()
-            });
-        }
-    }
-
     let prefix = &bucket.prefix;
+
+    let settings = load_settings(dir, &client, &cfg, bucket).await;
+    maybe_push_settings(dir, &client, &cfg, bucket).await?;
+
+    let scan = scan_local(dir, &settings).await?;
+    let manifest = get_manifest(&client, &cfg, bucket).await;
+    if manifest.as_ref().map(|m| m.overall) == Some(scan.overall) {
+        return Ok(CacheSyncStats {
+            skipped: true,
+            ..Default::default()
+        });
+    }
+    let remote_content = manifest.map(|m| m.content).unwrap_or_default();
+
     let remote_full = list_objects(&client, &cfg, &bucket.bucket, prefix).await?;
     let remote_rel: HashSet<String> = remote_full
         .iter()
         .filter_map(|k| strip_prefix(k, prefix))
-        .filter(|r| *r != FINGERPRINT_REL)
-        .map(|r| r.to_string())
+        .filter(|r| !is_control(r))
+        .map(String::from)
         .collect();
 
     let mut uploaded = 0;
-    for (rel, path) in &local {
-        if remote_rel.contains(rel) {
-            continue;
+    // Seed with remote content hashes so content files we don't touch stay tracked.
+    let mut stored_content: BTreeMap<String, u64> = remote_content.clone();
+
+    for f in &scan.files {
+        match f.strategy {
+            Strategy::Path => {
+                if !remote_rel.contains(&f.rel) {
+                    let bytes = tokio::fs::read(&f.path).await?;
+                    put_object(
+                        &client,
+                        &cfg,
+                        &bucket.bucket,
+                        &obj_key(prefix, &f.rel),
+                        bytes,
+                    )
+                    .await?;
+                    uploaded += 1;
+                }
+            }
+            Strategy::Content => {
+                if remote_content.get(&f.rel).copied() != f.content_hash {
+                    let bytes = tokio::fs::read(&f.path).await?;
+                    put_object(
+                        &client,
+                        &cfg,
+                        &bucket.bucket,
+                        &obj_key(prefix, &f.rel),
+                        bytes,
+                    )
+                    .await?;
+                    uploaded += 1;
+                }
+                if let Some(h) = f.content_hash {
+                    stored_content.insert(f.rel.clone(), h);
+                }
+            }
+            Strategy::JsonMerge => {
+                if remote_content.get(&f.rel).copied() == f.content_hash {
+                    if let Some(h) = f.content_hash {
+                        stored_content.insert(f.rel.clone(), h);
+                    }
+                    continue;
+                }
+                let local_bytes = tokio::fs::read(&f.path).await?;
+                let merged = if remote_rel.contains(&f.rel) {
+                    match get_object(&client, &cfg, &bucket.bucket, &obj_key(prefix, &f.rel))
+                        .await?
+                    {
+                        Some(remote_bytes) => merge_json_maps(&remote_bytes, &local_bytes)
+                            .map(|m| {
+                                // Also write the union back locally so both sides converge.
+                                (m, true)
+                            })
+                            .unwrap_or_else(|| {
+                                log::warn!(
+                                    "tysm cache: {} is not a JSON object; uploading local copy",
+                                    f.rel
+                                );
+                                (local_bytes.clone(), false)
+                            }),
+                        None => (local_bytes.clone(), false),
+                    }
+                } else {
+                    (local_bytes.clone(), false)
+                };
+                let (final_bytes, write_back) = merged;
+                if write_back {
+                    tokio::fs::write(&f.path, &final_bytes).await?;
+                }
+                let hash = xxh3_64(&final_bytes);
+                put_object(
+                    &client,
+                    &cfg,
+                    &bucket.bucket,
+                    &obj_key(prefix, &f.rel),
+                    final_bytes,
+                )
+                .await?;
+                uploaded += 1;
+                stored_content.insert(f.rel.clone(), hash);
+            }
         }
-        let bytes = tokio::fs::read(path).await?;
-        put_object(&client, &cfg, &bucket.bucket, &obj_key(prefix, rel), bytes).await?;
-        uploaded += 1;
     }
 
-    // Record the fingerprint of the *union* (what the bucket now contains) so a future
-    // run that holds the same set hits the fast path.
-    let union: HashSet<String> = local_keys.union(&remote_rel).cloned().collect();
-    let union_fp = fingerprint(&union);
-    put_object(
+    // Fingerprint of the resulting bucket state: every path-strategy object (union of
+    // remote and local) plus every tracked content file.
+    let mut path_union: HashSet<&str> = scan
+        .files
+        .iter()
+        .filter(|f| f.strategy == Strategy::Path)
+        .map(|f| f.rel.as_str())
+        .collect();
+    for r in &remote_rel {
+        if settings.strategy_for(r) == Strategy::Path {
+            path_union.insert(r.as_str());
+        }
+    }
+    let mut overall = 0u64;
+    for p in &path_union {
+        overall = overall.wrapping_add(identity(p, None));
+    }
+    for (rel, h) in &stored_content {
+        overall = overall.wrapping_add(identity(rel, Some(*h)));
+    }
+    put_manifest(
         &client,
         &cfg,
-        &bucket.bucket,
-        &obj_key(prefix, FINGERPRINT_REL),
-        union_fp.to_string().into_bytes(),
+        bucket,
+        &Manifest {
+            overall,
+            content: stored_content,
+        },
     )
     .await?;
 
@@ -248,30 +494,129 @@ async fn push(dir: &Path, bucket: &CacheBucket) -> Result<CacheSyncStats, CacheS
     })
 }
 
-async fn get_fingerprint(
+/// Union two JSON objects by top-level key (local wins on collision). Returns `None` if
+/// either side is not a JSON object.
+fn merge_json_maps(remote: &[u8], local: &[u8]) -> Option<Vec<u8>> {
+    type Map = serde_json::Map<String, serde_json::Value>;
+    let mut merged: Map = serde_json::from_slice(remote).ok()?;
+    let local: Map = serde_json::from_slice(local).ok()?;
+    for (k, v) in local {
+        merged.insert(k, v);
+    }
+    serde_json::to_vec(&merged).ok()
+}
+
+// ===================================================================================
+// Settings / manifest objects
+// ===================================================================================
+
+/// Load sync settings, preferring a local `.tysm-sync.json`, then the bucket's copy
+/// (cached locally for next time), else defaults. Best-effort: parse errors log and
+/// fall back to defaults.
+async fn load_settings(
+    dir: &Path,
     client: &reqwest::Client,
     cfg: &R2Config,
     bucket: &CacheBucket,
-) -> Result<Option<u64>, CacheSyncError> {
-    let key = obj_key(&bucket.prefix, FINGERPRINT_REL);
-    let Some(bytes) = get_object(client, cfg, &bucket.bucket, &key).await? else {
-        return Ok(None);
+) -> SyncSettings {
+    let local_path = dir.join(SETTINGS_REL);
+    if let Ok(bytes) = tokio::fs::read(&local_path).await {
+        return parse_settings(&bytes);
+    }
+    let key = obj_key(&bucket.prefix, SETTINGS_REL);
+    if let Ok(Some(bytes)) = get_object(client, cfg, &bucket.bucket, &key).await {
+        let _ = tokio::fs::write(&local_path, &bytes).await;
+        return parse_settings(&bytes);
+    }
+    SyncSettings::default()
+}
+
+fn parse_settings(bytes: &[u8]) -> SyncSettings {
+    serde_json::from_slice(bytes).unwrap_or_else(|e| {
+        log::warn!("tysm cache: ignoring invalid {SETTINGS_REL}: {e}");
+        SyncSettings::default()
+    })
+}
+
+/// Upload the local settings file to the bucket if it exists and differs from the remote.
+async fn maybe_push_settings(
+    dir: &Path,
+    client: &reqwest::Client,
+    cfg: &R2Config,
+    bucket: &CacheBucket,
+) -> Result<(), CacheSyncError> {
+    let Ok(local_bytes) = tokio::fs::read(dir.join(SETTINGS_REL)).await else {
+        return Ok(());
     };
-    Ok(String::from_utf8(bytes)
-        .ok()
-        .and_then(|s| s.trim().parse().ok()))
+    let key = obj_key(&bucket.prefix, SETTINGS_REL);
+    let remote = get_object(client, cfg, &bucket.bucket, &key).await?;
+    if remote.as_deref() != Some(local_bytes.as_slice()) {
+        put_object(client, cfg, &bucket.bucket, &key, local_bytes).await?;
+    }
+    Ok(())
+}
+
+async fn get_manifest(
+    client: &reqwest::Client,
+    cfg: &R2Config,
+    bucket: &CacheBucket,
+) -> Option<Manifest> {
+    let key = obj_key(&bucket.prefix, MANIFEST_REL);
+    match get_object(client, cfg, &bucket.bucket, &key).await {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).ok(),
+        _ => None,
+    }
+}
+
+async fn put_manifest(
+    client: &reqwest::Client,
+    cfg: &R2Config,
+    bucket: &CacheBucket,
+    manifest: &Manifest,
+) -> Result<(), CacheSyncError> {
+    let key = obj_key(&bucket.prefix, MANIFEST_REL);
+    let bytes = serde_json::to_vec(manifest).unwrap_or_default();
+    put_object(client, cfg, &bucket.bucket, &key, bytes).await
+}
+
+/// Wildcard match supporting `*` (any run, including `/`) and `?` (one char).
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 // ===================================================================================
 // Local cache directory helpers
 // ===================================================================================
 
-/// The wrapping sum of `xxh3` hashes of the relative cache paths. Commutative, so it is
-/// independent of iteration order and equal iff the two directories hold the same key set.
-fn fingerprint(keys: &HashSet<String>) -> u64 {
-    use xxhash_rust::xxh3::xxh3_64;
-    keys.iter()
-        .fold(0u64, |acc, k| acc.wrapping_add(xxh3_64(k.as_bytes())))
+/// Write `bytes` to `<dir>/<rel>`, creating parent directories as needed.
+async fn write_cache_file(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let dest = dir.join(rel);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&dest, bytes).await
 }
 
 /// Walk `dir`, returning `(relative-key, absolute-path)` for every file. The relative key
@@ -298,7 +643,7 @@ async fn list_cache_files(dir: &Path) -> Result<Vec<(String, PathBuf)>, std::io:
                     .map(|c| c.as_os_str().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
-                if rel == FINGERPRINT_REL {
+                if is_control(&rel) {
                     continue;
                 }
                 out.push((rel, path));
@@ -725,21 +1070,84 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// The overall fingerprint is a commutative sum of per-file identities, so it is
+    /// order-independent and changes when the set changes or a content hash changes.
     #[test]
-    fn fingerprint_is_order_independent() {
-        let a: HashSet<String> = ["042/aaa", "100/bbb", "999/ccc"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let b: HashSet<String> = ["999/ccc", "042/aaa", "100/bbb"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(fingerprint(&a), fingerprint(&b));
+    fn fingerprint_is_order_independent_and_sensitive() {
+        let sum = |parts: &[u64]| parts.iter().fold(0u64, |a, p| a.wrapping_add(*p));
 
-        let mut c = a.clone();
-        c.insert("123/ddd".to_string());
-        assert_ne!(fingerprint(&a), fingerprint(&c));
+        let a = [
+            identity("042/aaa", None),
+            identity("100/bbb", None),
+            identity("translate.json", Some(7)),
+        ];
+        let b = [
+            identity("translate.json", Some(7)),
+            identity("042/aaa", None),
+            identity("100/bbb", None),
+        ];
+        assert_eq!(sum(&a), sum(&b), "order must not matter");
+
+        // A changed content hash for the same path changes the fingerprint.
+        assert_ne!(
+            identity("translate.json", Some(7)),
+            identity("translate.json", Some(8)),
+        );
+        // Adding a file changes the fingerprint.
+        let c = [a[0], a[1], a[2], identity("123/ddd", None)];
+        assert_ne!(sum(&a), sum(&c));
+    }
+
+    #[test]
+    fn glob_match_rules() {
+        assert!(glob_match(
+            "google_translate/master_cache.json",
+            "google_translate/master_cache.json"
+        ));
+        assert!(glob_match(
+            "google_translate/*.json",
+            "google_translate/master_cache.json"
+        ));
+        assert!(glob_match(
+            "*/master_cache.json",
+            "google_translate/master_cache.json"
+        ));
+        assert!(!glob_match(
+            "google_translate/*.bin",
+            "google_translate/master_cache.json"
+        ));
+        assert!(!glob_match(
+            "wiktionary/*",
+            "google_translate/master_cache.json"
+        ));
+    }
+
+    #[test]
+    fn strategy_lookup_and_default() {
+        let settings: SyncSettings = serde_json::from_str(
+            r#"{"files":[{"path":"google_translate/*.json","strategy":"json_merge"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.strategy_for("google_translate/master_cache.json"),
+            Strategy::JsonMerge
+        );
+        // Anything not matched is content-addressed (path) by default.
+        assert_eq!(settings.strategy_for("042/abc"), Strategy::Path);
+    }
+
+    #[test]
+    fn json_merge_unions_keys_local_wins() {
+        let remote = br#"{"a":1,"b":2}"#;
+        let local = br#"{"b":99,"c":3}"#;
+        let merged = merge_json_maps(remote, local).unwrap();
+        let m: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&merged).unwrap();
+        assert_eq!(m["a"], 1);
+        assert_eq!(m["b"], 99, "local value wins on collision");
+        assert_eq!(m["c"], 3);
+        // Non-objects are rejected (caller falls back to whole-file handling).
+        assert!(merge_json_maps(b"[1,2]", b"{}").is_none());
     }
 
     #[test]
