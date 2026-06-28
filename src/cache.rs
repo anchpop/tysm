@@ -133,9 +133,7 @@ impl ShardStore {
         // failed append must never lose cached data.
         if !batch.is_empty() {
             if let Err(e) = append(&self.log_path(n), &batch).await {
-                log::warn!(
-                    "tysm cache: failed to fold legacy shard {n:03}; keeping it: {e}"
-                );
+                log::warn!("tysm cache: failed to fold legacy shard {n:03}; keeping it: {e}");
                 return;
             }
         }
