@@ -1,3 +1,6 @@
 /target
 .aider*
 .env
+
+# wrangler local cache
+.wrangler/

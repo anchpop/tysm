@@ -1113,7 +1113,7 @@ impl ChatClient {
                 if let Some(cache_directory) = &self.cache_directory {
                     // Compress the response with zstd before writing to disk
                     let compressed = zstd::encode_all(chat_response.as_bytes(), 3)?;
-                    crate::utils::write_to_cache_dir(
+                    crate::cache::write_to_cache_dir(
                         cache_directory,
                         &chat_request_cache_key,
                         &compressed,
@@ -1400,12 +1400,12 @@ impl ChatClient {
             let copy_as_key = copy_as_key.to_string();
             async move {
                 // Check main cache directory
-                if let Some(data) = crate::utils::read_from_cache_dir(&cache_directory, &key).await
+                if let Some(data) = crate::cache::read_from_cache_dir(&cache_directory, &key).await
                 {
                     // If found under a different key, copy to the canonical key
                     if key != copy_as_key {
                         let _ =
-                            crate::utils::write_to_cache_dir(&cache_directory, &copy_as_key, &data)
+                            crate::cache::write_to_cache_dir(&cache_directory, &copy_as_key, &data)
                                 .await;
                     }
                     return Some(data);
@@ -1414,9 +1414,9 @@ impl ChatClient {
                 // Check backup cache directory
                 if let Some(backup) = &backup_cache_directory {
                     if backup.exists() {
-                        if let Some(data) = crate::utils::read_from_cache_dir(backup, &key).await {
+                        if let Some(data) = crate::cache::read_from_cache_dir(backup, &key).await {
                             // Copy to main cache under the canonical key
-                            let _ = crate::utils::write_to_cache_dir(
+                            let _ = crate::cache::write_to_cache_dir(
                                 &cache_directory,
                                 &copy_as_key,
                                 &data,
