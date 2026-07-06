@@ -68,7 +68,7 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         cached_input: None,
         output: 4.0,
     },
-    // Anthropic (new models, copied from https://www.anthropic.com/pricing on 2026-06-24)
+    // Anthropic (new models, copied from https://platform.claude.com/docs/en/about-claude/pricing on 2026-07-06)
     ModelCost {
         name: "claude-fable-5",
         input: 10.0,
@@ -104,6 +104,14 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         input: 3.0,
         cached_input: None,
         output: 15.0,
+    },
+    // Introductory pricing through 2026-08-31; becomes 3.0/15.0 on 2026-09-01.
+    // https://platform.claude.com/docs/en/about-claude/pricing
+    ModelCost {
+        name: "claude-sonnet-5",
+        input: 2.0,
+        cached_input: None,
+        output: 10.0,
     },
     ModelCost {
         name: "claude-haiku-4-5",
