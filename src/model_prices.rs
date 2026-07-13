@@ -292,6 +292,31 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
     },
     // GPT-5 models
     ModelCost {
+        // "gpt-5.6" alias routes to gpt-5.6-sol
+        name: "gpt-5.6",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
+    ModelCost {
+        name: "gpt-5.6-sol",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
+    ModelCost {
+        name: "gpt-5.6-terra",
+        input: 2.50,
+        cached_input: Some(0.25),
+        output: 15.00,
+    },
+    ModelCost {
+        name: "gpt-5.6-luna",
+        input: 1.00,
+        cached_input: Some(0.10),
+        output: 6.00,
+    },
+    ModelCost {
         name: "gpt-5.5-pro",
         input: 30.00,
         cached_input: None,
