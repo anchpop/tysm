@@ -239,25 +239,25 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
     ModelCost {
         name: "gemini-3.1-pro",
         input: 2.00,
-        cached_input: None,
+        cached_input: Some(0.20),
         output: 12.00,
     },
     ModelCost {
         name: "gemini-3-flash",
         input: 0.50,
-        cached_input: None,
+        cached_input: Some(0.05),
         output: 3.00,
     },
     ModelCost {
         name: "gemini-3.1-flash-lite",
         input: 0.25,
-        cached_input: None,
+        cached_input: Some(0.025),
         output: 1.50,
     },
     ModelCost {
         name: "gemini-3.5-flash",
         input: 1.50,
-        cached_input: None,
+        cached_input: Some(0.15),
         output: 9.00,
     },
     ModelCost {
