@@ -82,6 +82,12 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         output: 50.0,
     },
     ModelCost {
+        name: "claude-opus-5",
+        input: 5.0,
+        cached_input: None,
+        output: 25.0,
+    },
+    ModelCost {
         name: "claude-opus-4-8",
         input: 5.0,
         cached_input: None,
@@ -259,6 +265,19 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         input: 1.50,
         cached_input: Some(0.15),
         output: 9.00,
+    },
+    // Released 2026-07-21 (google blog: gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber)
+    ModelCost {
+        name: "gemini-3.6-flash",
+        input: 1.50,
+        cached_input: Some(0.15),
+        output: 7.50,
+    },
+    ModelCost {
+        name: "gemini-3.5-flash-lite",
+        input: 0.30,
+        cached_input: Some(0.03),
+        output: 2.50,
     },
     ModelCost {
         name: "gemini-2.5-pro",
