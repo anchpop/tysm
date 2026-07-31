@@ -59,6 +59,12 @@ pub struct ChatClient {
     /// The service tier to use for requests (e.g., "flex")
     pub service_tier: Option<String>,
 
+    /// The prompt cache key to send with requests. A routing hint for provider-side
+    /// prompt caching (OpenAI `prompt_cache_key`): requests sharing a key are routed to
+    /// the same cache, making prefix hits reliable. On GPT-5.6+ setting it is required
+    /// for dependable cache matching. Does not affect response content.
+    pub prompt_cache_key: Option<String>,
+
     /// The reasoning effort to use for requests (e.g., "low", "medium", "high")
     pub reasoning_effort: Option<String>,
 
@@ -233,6 +239,10 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
 
+    /// The prompt cache key for provider-side prompt-cache routing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+
     /// The reasoning effort to use for the request (e.g., "low", "medium", "high")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -245,11 +255,14 @@ pub struct ChatRequest {
 
 impl ChatRequest {
     fn cache_key(&self) -> String {
-        // Create a version of the request without service_tier for caching
-        // This ensures requests with different service tiers share the same cache
+        // Create a version of the request without service_tier or prompt_cache_key for
+        // caching. Neither affects response content (one is a scheduling tier, the other
+        // a provider-side cache-routing hint), so requests differing only in those fields
+        // share the same cached response.
         // Note: reasoning_effort IS included in the cache key since it affects output
         let mut cacheable = self.clone();
         cacheable.service_tier = None;
+        cacheable.prompt_cache_key = None;
 
         let serialized = serde_json::to_string(&cacheable).unwrap();
         let id = const_xxh3(serialized.as_bytes());
@@ -266,6 +279,7 @@ impl ChatRequest {
     fn legacy_cache_key(&self) -> String {
         let mut cacheable = self.clone();
         cacheable.service_tier = None;
+        cacheable.prompt_cache_key = None;
 
         let serialized = serde_json::to_string(&LegacyChatRequest::from(cacheable)).unwrap();
         let id = const_xxh3(serialized.as_bytes());
@@ -731,6 +745,7 @@ impl ChatClient {
             cache_directory: None,
             backup_cache_directory: None,
             service_tier: None,
+            prompt_cache_key: None,
             reasoning_effort: None,
             extra_body: None,
             semaphore: Semaphore::new(100),
@@ -774,6 +789,15 @@ impl ChatClient {
     /// Set the service tier for requests (e.g., "flex")
     pub fn with_service_tier(mut self, service_tier: impl Into<String>) -> Self {
         self.service_tier = Some(service_tier.into());
+        self
+    }
+
+    /// Set the prompt cache key for requests. A provider-side cache-routing hint
+    /// (OpenAI `prompt_cache_key`); use one key per stable prompt prefix. Like the
+    /// service tier, it does not affect response content, so it is excluded from the
+    /// local response-cache key — setting or changing it never invalidates the cache.
+    pub fn with_prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
+        self.prompt_cache_key = Some(prompt_cache_key.into());
         self
     }
 
@@ -1022,6 +1046,7 @@ impl ChatClient {
             messages,
             response_format,
             service_tier: self.service_tier.clone(),
+            prompt_cache_key: self.prompt_cache_key.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             extra_body: self.extra_body.clone(),
         };
@@ -1234,6 +1259,7 @@ impl ChatClient {
                                 messages,
                                 response_format,
                                 service_tier: self.service_tier.clone(),
+                                prompt_cache_key: self.prompt_cache_key.clone(),
                                 reasoning_effort: self.reasoning_effort.clone(),
                                 extra_body: self.extra_body.clone(),
                             },
@@ -1546,12 +1572,14 @@ fn test_deser() {
 
 #[test]
 fn service_tier_excluded_from_cache_key() {
-    // Create two identical requests except for service_tier
+    // Create two identical requests except for service_tier and prompt_cache_key,
+    // neither of which affects response content
     let request1 = ChatRequest {
         model: "gpt-4o".to_string(),
         messages: vec![ChatMessage::user("test")],
         response_format: ResponseFormat::Text,
         service_tier: None,
+        prompt_cache_key: None,
         reasoning_effort: None,
         extra_body: None,
     };
@@ -1561,12 +1589,23 @@ fn service_tier_excluded_from_cache_key() {
         messages: vec![ChatMessage::user("test")],
         response_format: ResponseFormat::Text,
         service_tier: Some("flex".to_string()),
+        prompt_cache_key: Some("my-prompt-cache-key".to_string()),
         reasoning_effort: None,
         extra_body: None,
     };
 
-    // The cache keys should be identical even though service_tier differs
+    // The cache keys should be identical even though service_tier and
+    // prompt_cache_key differ
     assert_eq!(request1.cache_key(), request2.cache_key());
+
+    // An unset prompt_cache_key must vanish from the serialization entirely, so cache
+    // keys hashed before the field existed still match — adding the field must not
+    // orphan existing on-disk caches.
+    let serialized = serde_json::to_string(&request1).unwrap();
+    assert!(
+        !serialized.contains("prompt_cache_key"),
+        "None prompt_cache_key leaked into serialization: {serialized}"
+    );
 
     // Test that reasoning_effort IS included in cache key (different reasoning_effort = different cache)
     let request3 = ChatRequest {
@@ -1574,6 +1613,7 @@ fn service_tier_excluded_from_cache_key() {
         messages: vec![ChatMessage::user("test")],
         response_format: ResponseFormat::Text,
         service_tier: None,
+        prompt_cache_key: None,
         reasoning_effort: Some("high".to_string()),
         extra_body: None,
     };
@@ -1586,6 +1626,7 @@ fn service_tier_excluded_from_cache_key() {
         messages: vec![ChatMessage::user("different message")],
         response_format: ResponseFormat::Text,
         service_tier: Some("flex".to_string()),
+        prompt_cache_key: Some("my-prompt-cache-key".to_string()),
         reasoning_effort: Some("high".to_string()),
         extra_body: None,
     };
@@ -1624,6 +1665,7 @@ fn schema_has_no_duplicate_additional_properties() {
             json_schema: JsonSchemaFormat::new::<TestStruct>(),
         },
         service_tier: None,
+        prompt_cache_key: None,
         reasoning_effort: None,
         extra_body: None,
     };
@@ -1639,6 +1681,7 @@ fn schema_has_no_duplicate_additional_properties() {
         messages: vec![ChatMessage::user("test")],
         response_format: ResponseFormat::Text,
         service_tier: None,
+        prompt_cache_key: None,
         reasoning_effort: None,
         extra_body: None,
     };
