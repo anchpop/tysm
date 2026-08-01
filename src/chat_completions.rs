@@ -48,8 +48,11 @@ pub struct ChatClient {
     pub model: String,
     /// A cache of recent responses.
     pub lru: DashMap<String, String>,
-    /// This client's token consumption (as reported by the API). Batch requests will not affect `usage`.
+    /// This client's token consumption (as reported by the API). Batch API requests are tracked separately in `batch_usage`.
     pub usage: RwLock<ChatUsage>,
+    /// This client's token consumption via the Batch API (as reported by the API). Tracked
+    /// separately from `usage` because OpenAI bills batch requests at 50% of the standard price.
+    pub batch_usage: RwLock<ChatUsage>,
     /// The directory in which to cache responses to requests
     pub cache_directory: Option<PathBuf>,
 
@@ -742,6 +745,7 @@ impl ChatClient {
             model: model.into(),
             lru: DashMap::new(),
             usage: RwLock::new(ChatUsage::default()),
+            batch_usage: RwLock::new(ChatUsage::default()),
             cache_directory: None,
             backup_cache_directory: None,
             service_tier: None,
@@ -1367,6 +1371,16 @@ impl ChatClient {
             })
             .collect::<Result<HashMap<_, _>, BatchChatError>>()?;
 
+        // Each entry in `results` is one billed batch request; accumulate its reported
+        // usage. (A batch reattached from a previous run is counted again — the tokens
+        // were genuinely billed, just possibly already counted by the earlier process.)
+        {
+            let mut batch_usage = self.batch_usage.write().unwrap();
+            for response in results.values() {
+                *batch_usage += response.usage;
+            }
+        }
+
         let results = custom_ids
             .into_iter()
             .map(|custom_id| {
@@ -1521,22 +1535,32 @@ impl ChatClient {
         }
     }
 
-    /// Returns how many tokens have been used so far.
+    /// Returns how many tokens have been used so far, excluding Batch API requests
+    /// (see [`batch_usage`](Self::batch_usage)).
     ///
     /// Does not double-count tokens used in cached responses.
     pub fn usage(&self) -> ChatUsage {
         *self.usage.read().unwrap()
     }
 
-    /// Attempts to compute the cost in dollars of the usage of this client.
+    /// Returns how many tokens have been used via the Batch API so far.
+    pub fn batch_usage(&self) -> ChatUsage {
+        *self.batch_usage.read().unwrap()
+    }
+
+    /// Attempts to compute the cost in dollars of the usage of this client,
+    /// including Batch API usage at its 50% discount.
     ///
     /// This is provided on a best-effort basis. The prices are hardcoded into
     /// the library (as OpenAI doesn't provide an API to get API pricing info),
     /// and may be out of date or unavailable for the model you're using.
     /// If you notice the prices being out of date, [please leave an issue](https://github.com/not-pizza/tysm)!
     pub fn cost(&self) -> Option<f64> {
-        let usage = self.usage();
-        crate::model_prices::cost(&self.model, self.service_tier.as_deref(), usage)
+        let live =
+            crate::model_prices::cost(&self.model, self.service_tier.as_deref(), self.usage())?;
+        // Batch pricing is a flat 50% of the standard (non-tier) price.
+        let batch = crate::model_prices::cost(&self.model, None, self.batch_usage())? / 2.0;
+        Some(live + batch)
     }
 }
 
@@ -1568,6 +1592,27 @@ fn test_deser() {
 }
 "#;
     let _chat_response: ChatResponse = serde_json::from_str(s).unwrap();
+}
+
+#[test]
+fn cost_includes_batch_usage_at_half_price() {
+    let client = ChatClient::new("sk-test", "gpt-4o");
+    let usage = ChatUsage {
+        prompt_tokens: 1_000_000,
+        completion_tokens: 1_000_000,
+        total_tokens: 2_000_000,
+        prompt_token_details: None,
+        completion_token_details: None,
+    };
+
+    *client.usage.write().unwrap() = usage;
+    let live_only = client.cost().unwrap();
+
+    *client.batch_usage.write().unwrap() = usage;
+    let with_batch = client.cost().unwrap();
+
+    // The same usage again via the Batch API should cost exactly half as much more.
+    assert!((with_batch - live_only * 1.5).abs() < 1e-9);
 }
 
 #[test]
