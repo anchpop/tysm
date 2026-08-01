@@ -323,17 +323,19 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         cached_input: Some(0.50),
         output: 30.00,
     },
+    // Cut 20% on 2026-07-30 (from 2.50/0.25/15.00); https://openai.com/pricing
     ModelCost {
         name: "gpt-5.6-terra",
-        input: 2.50,
-        cached_input: Some(0.25),
-        output: 15.00,
+        input: 2.00,
+        cached_input: Some(0.20),
+        output: 12.00,
     },
+    // Cut 80% on 2026-07-30 (from 1.00/0.10/6.00); https://openai.com/pricing
     ModelCost {
         name: "gpt-5.6-luna",
-        input: 1.00,
-        cached_input: Some(0.10),
-        output: 6.00,
+        input: 0.20,
+        cached_input: Some(0.02),
+        output: 1.20,
     },
     ModelCost {
         name: "gpt-5.5-pro",
