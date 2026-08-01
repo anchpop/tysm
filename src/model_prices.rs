@@ -68,7 +68,7 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         cached_input: None,
         output: 4.0,
     },
-    // Anthropic (new models, copied from https://www.anthropic.com/pricing on 2026-06-24)
+    // Anthropic (new models, copied from https://platform.claude.com/docs/en/about-claude/pricing on 2026-07-06)
     ModelCost {
         name: "claude-fable-5",
         input: 10.0,
@@ -80,6 +80,12 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         input: 10.0,
         cached_input: None,
         output: 50.0,
+    },
+    ModelCost {
+        name: "claude-opus-5",
+        input: 5.0,
+        cached_input: None,
+        output: 25.0,
     },
     ModelCost {
         name: "claude-opus-4-8",
@@ -104,6 +110,14 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         input: 3.0,
         cached_input: None,
         output: 15.0,
+    },
+    // Introductory pricing through 2026-08-31; becomes 3.0/15.0 on 2026-09-01.
+    // https://platform.claude.com/docs/en/about-claude/pricing
+    ModelCost {
+        name: "claude-sonnet-5",
+        input: 2.0,
+        cached_input: None,
+        output: 10.0,
     },
     ModelCost {
         name: "claude-haiku-4-5",
@@ -231,26 +245,39 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
     ModelCost {
         name: "gemini-3.1-pro",
         input: 2.00,
-        cached_input: None,
+        cached_input: Some(0.20),
         output: 12.00,
     },
     ModelCost {
         name: "gemini-3-flash",
         input: 0.50,
-        cached_input: None,
+        cached_input: Some(0.05),
         output: 3.00,
     },
     ModelCost {
         name: "gemini-3.1-flash-lite",
         input: 0.25,
-        cached_input: None,
+        cached_input: Some(0.025),
         output: 1.50,
     },
     ModelCost {
         name: "gemini-3.5-flash",
         input: 1.50,
-        cached_input: None,
+        cached_input: Some(0.15),
         output: 9.00,
+    },
+    // Released 2026-07-21 (google blog: gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber)
+    ModelCost {
+        name: "gemini-3.6-flash",
+        input: 1.50,
+        cached_input: Some(0.15),
+        output: 7.50,
+    },
+    ModelCost {
+        name: "gemini-3.5-flash-lite",
+        input: 0.30,
+        cached_input: Some(0.03),
+        output: 2.50,
     },
     ModelCost {
         name: "gemini-2.5-pro",
@@ -283,6 +310,33 @@ pub(crate) const CHAT_COMPLETIONS: &[ModelCost] = &[
         output: 0.30,
     },
     // GPT-5 models
+    ModelCost {
+        // "gpt-5.6" alias routes to gpt-5.6-sol
+        name: "gpt-5.6",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
+    ModelCost {
+        name: "gpt-5.6-sol",
+        input: 5.00,
+        cached_input: Some(0.50),
+        output: 30.00,
+    },
+    // Cut 20% on 2026-07-30 (from 2.50/0.25/15.00); https://openai.com/pricing
+    ModelCost {
+        name: "gpt-5.6-terra",
+        input: 2.00,
+        cached_input: Some(0.20),
+        output: 12.00,
+    },
+    // Cut 80% on 2026-07-30 (from 1.00/0.10/6.00); https://openai.com/pricing
+    ModelCost {
+        name: "gpt-5.6-luna",
+        input: 0.20,
+        cached_input: Some(0.02),
+        output: 1.20,
+    },
     ModelCost {
         name: "gpt-5.5-pro",
         input: 30.00,
