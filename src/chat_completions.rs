@@ -84,8 +84,8 @@ pub struct ChatClient {
     /// hitting the API. Useful for testing or offline usage.
     pub cached_only: bool,
 
-    /// Clients whose caches are checked, in order, before this client's cache. These clients
-    /// are never allowed to make API requests through this client.
+    /// Clients whose caches are checked in order after this client's cache. These clients are
+    /// never allowed to make API requests through this client. Configure them newest-to-oldest.
     cache_fallbacks: Vec<ChatClient>,
 }
 
@@ -847,12 +847,12 @@ impl ChatClient {
         }
     }
 
-    /// Check another client's cache before this client's cache, without ever allowing the
-    /// fallback client to make an API request.
+    /// Check another client's cache after this client's cache, without ever allowing the
+    /// fallback client to make an API request. Add multiple fallbacks newest-to-oldest.
     ///
     /// This is useful when migrating models: configure the new model as `self`, then add the
-    /// old model as a cache fallback. Requests reuse valid old-model responses when available,
-    /// otherwise reuse this client's cache, and only then call this client's API.
+    /// old model as a cache fallback. Requests reuse this client's cache first, then valid
+    /// old-model responses, and only then call this client's API.
     /// Multiple fallbacks are checked in the order they are added.
     pub fn with_cache_fallback(mut self, fallback: ChatClient) -> Self {
         self.cache_fallbacks.push(fallback);
@@ -1143,6 +1143,22 @@ impl ChatClient {
             map_response(chat_response).map(|mapped_response| (mapped_response, response.usage))
         };
 
+        if let Some(cached_response) = self
+            .chat_cached(&chat_request, process_result.clone())
+            .await
+        {
+            match cached_response {
+                Ok((result, _usage)) => {
+                    debug!("Using cached response from current model {}", self.model);
+                    return Ok(result);
+                }
+                Err(error) => warn!(
+                    "Ignoring invalid cached response from current model {}: {}",
+                    self.model, error
+                ),
+            }
+        }
+
         for fallback in &self.cache_fallbacks {
             let fallback_request = ChatRequest {
                 model: fallback.model.clone(),
@@ -1176,44 +1192,34 @@ impl ChatClient {
             }
         }
 
-        let chat_response = if let Some(cached_response) = self
-            .chat_cached(&chat_request, process_result.clone())
-            .await
+        if self.cached_only {
+            return Err(ChatError::CacheMiss);
+        }
+        let chat_response = self.chat_uncached(&chat_request).await?;
+        let (result, usage) = process_result(chat_response.clone())?;
+        *self.usage.write().unwrap() += usage;
+
+        // cache the response
         {
-            debug!("Using cached response");
-            let (result, _usage) = cached_response?;
-            result
-        } else {
-            if self.cached_only {
-                return Err(ChatError::CacheMiss);
+            let chat_request_cache_key = chat_request.cache_key();
+            let chat_request = serde_json::to_string(&chat_request)
+                .map_err(|e| ChatError::JsonSerializeError(e, chat_request.clone()))?;
+
+            if let Some(cache_directory) = &self.cache_directory {
+                // Compress the response with zstd before writing to disk
+                let compressed = zstd::encode_all(chat_response.as_bytes(), 3)?;
+                crate::cache::write_to_cache_dir(
+                    cache_directory,
+                    &chat_request_cache_key,
+                    &compressed,
+                )
+                .await?;
             }
-            let chat_response = self.chat_uncached(&chat_request).await?;
-            let (result, usage) = process_result(chat_response.clone())?;
-            *self.usage.write().unwrap() += usage;
 
-            // cache the response
-            {
-                let chat_request_cache_key = chat_request.cache_key();
-                let chat_request = serde_json::to_string(&chat_request)
-                    .map_err(|e| ChatError::JsonSerializeError(e, chat_request.clone()))?;
+            self.lru.insert(chat_request, chat_response);
+        }
 
-                if let Some(cache_directory) = &self.cache_directory {
-                    // Compress the response with zstd before writing to disk
-                    let compressed = zstd::encode_all(chat_response.as_bytes(), 3)?;
-                    crate::cache::write_to_cache_dir(
-                        cache_directory,
-                        &chat_request_cache_key,
-                        &compressed,
-                    )
-                    .await?;
-                }
-
-                self.lru.insert(chat_request, chat_response.clone());
-            }
-            result
-        };
-
-        Ok(chat_response)
+        Ok(result)
     }
 
     /// Send chat messages to the batch API and deserialize the responses into the given type.
@@ -1361,8 +1367,9 @@ impl ChatClient {
         &self,
         request: &ChatRequest,
     ) -> Option<Result<String, IndividualChatError>> {
-        let mut clients = self.cache_fallbacks.iter().collect::<Vec<_>>();
-        clients.push(self);
+        let clients = std::iter::once(self)
+            .chain(self.cache_fallbacks.iter())
+            .collect::<Vec<_>>();
 
         for client in clients {
             let candidate = ChatRequest {
