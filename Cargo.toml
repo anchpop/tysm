@@ -41,6 +41,7 @@ base64 = "0.22.1"
 tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread", "full"] }
 tokio-test = "0.4"
 anyhow = "1"
+tempfile = "3"
 
 [[example]]
 name = "chat-completions"
