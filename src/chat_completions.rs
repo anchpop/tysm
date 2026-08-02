@@ -19,7 +19,7 @@ use crate::batch::{BatchResponseItem, BatchStatus};
 use crate::schema::OpenAiTransform;
 use crate::utils::{api_key, OpenAiApiKeyError};
 use crate::OpenAiError;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 /// To use this library, you need to create a [`ChatClient`]. This contains various information needed to interact with the ChatGPT API,
 /// such as the API key, the model to use, and the URL of the API.
@@ -83,6 +83,10 @@ pub struct ChatClient {
     /// If true, all uncached requests will fail with [`ChatError::CacheMiss`] instead of
     /// hitting the API. Useful for testing or offline usage.
     pub cached_only: bool,
+
+    /// Clients whose caches are checked, in order, before this client's cache. These clients
+    /// are never allowed to make API requests through this client.
+    cache_fallbacks: Vec<ChatClient>,
 }
 
 /// The role of a message.
@@ -755,6 +759,7 @@ impl ChatClient {
             semaphore: Semaphore::new(100),
             http_client: crate::utils::pooled_client(),
             cached_only: false,
+            cache_fallbacks: Vec::new(),
         }
     }
 
@@ -832,6 +837,18 @@ impl ChatClient {
             cached_only: true,
             ..self
         }
+    }
+
+    /// Check another client's cache before this client's cache, without ever allowing the
+    /// fallback client to make an API request.
+    ///
+    /// This is useful when migrating models: configure the new model as `self`, then add the
+    /// old model as a cache fallback. Requests reuse valid old-model responses when available,
+    /// otherwise reuse this client's cache, and only then call this client's API.
+    /// Multiple fallbacks are checked in the order they are added.
+    pub fn with_cache_fallback(mut self, fallback: ChatClient) -> Self {
+        self.cache_fallbacks.push(fallback);
+        self
     }
 
     /// Sets the base URL
@@ -1117,6 +1134,39 @@ impl ChatClient {
 
             map_response(chat_response).map(|mapped_response| (mapped_response, response.usage))
         };
+
+        for fallback in &self.cache_fallbacks {
+            let fallback_request = ChatRequest {
+                model: fallback.model.clone(),
+                messages: chat_request.messages.clone(),
+                response_format: chat_request.response_format.clone(),
+                service_tier: fallback.service_tier.clone(),
+                prompt_cache_key: fallback.prompt_cache_key.clone(),
+                reasoning_effort: fallback.reasoning_effort.clone(),
+                extra_body: fallback.extra_body.clone(),
+            };
+
+            if let Some(cached_response) = fallback
+                .chat_cached(&fallback_request, process_result.clone())
+                .await
+            {
+                match cached_response {
+                    Ok((result, _usage)) => {
+                        debug!(
+                            "Using cached response from fallback model {}",
+                            fallback.model
+                        );
+                        return Ok(result);
+                    }
+                    Err(error) => {
+                        warn!(
+                            "Ignoring invalid cached response from fallback model {}: {}",
+                            fallback.model, error
+                        );
+                    }
+                }
+            }
+        }
 
         let chat_response = if let Some(cached_response) = self
             .chat_cached(&chat_request, process_result.clone())
@@ -1829,4 +1879,16 @@ async fn gemini_audio_transcription() {
         "Expected 'stale smell of old beer' in transcription, got: {}",
         result.text
     );
+}
+
+#[cfg(test)]
+#[test]
+fn cache_fallbacks_preserve_insertion_order() {
+    let client = ChatClient::new("unused", "new-model")
+        .with_cache_fallback(ChatClient::new("unused", "oldest-model"))
+        .with_cache_fallback(ChatClient::new("unused", "newer-model"));
+
+    assert_eq!(client.cache_fallbacks.len(), 2);
+    assert_eq!(client.cache_fallbacks[0].model, "oldest-model");
+    assert_eq!(client.cache_fallbacks[1].model, "newer-model");
 }
