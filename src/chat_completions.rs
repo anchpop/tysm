@@ -2125,3 +2125,65 @@ async fn batch_fn_pairs_objects_and_uses_fallback_cache_without_network() {
         }
     );
 }
+
+#[cfg(test)]
+#[tokio::test]
+async fn batch_prefers_current_model_cache_over_fallback_cache() {
+    #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
+    struct Answer {
+        value: String,
+    }
+
+    async fn cache_answer(client: &ChatClient, value: &str) {
+        let request = client.request_for_messages(
+            vec![
+                ChatMessage::system("return a value"),
+                ChatMessage::user("alpha"),
+            ],
+            ResponseFormat::JsonSchema {
+                json_schema: JsonSchemaFormat::new::<Answer>(),
+            },
+        );
+        client
+            .cache_batch_response(
+                &request,
+                &ChatResponse {
+                    id: "cached".into(),
+                    object: "chat.completion".into(),
+                    created: 0,
+                    model: client.model.clone(),
+                    system_fingerprint: None,
+                    choices: vec![ChatChoice {
+                        index: 0,
+                        message: ChatMessageResponse {
+                            role: Role::Assistant,
+                            content: Some(format!(r#"{{"value":"{value}"}}"#)),
+                            refusal: None,
+                        },
+                        logprobs: None,
+                        finish_reason: "stop".into(),
+                    }],
+                    usage: ChatUsage::default(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let current = ChatClient::new("unused", "current-model")
+        .with_cache_directory(temp.path().join("current"));
+    let fallback = ChatClient::new("unused", "fallback-model")
+        .with_cache_directory(temp.path().join("fallback"));
+    cache_answer(&current, "current").await;
+    cache_answer(&fallback, "fallback").await;
+
+    let client = current.with_cache_fallback(fallback).with_cached_only();
+    let items = vec!["alpha".to_string()];
+    let results = client
+        .batch_chat_with_system_prompt_fn::<_, _, Answer>("return a value", &items, Clone::clone)
+        .await
+        .unwrap();
+
+    assert_eq!(results[0].1.as_ref().unwrap().value, "current");
+}
