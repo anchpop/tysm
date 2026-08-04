@@ -40,6 +40,15 @@ async fn main() -> anyhow::Result<()> {
         .batch_chat_with_system_prompt::<Response>(
             "Respond in JSON format with the city and country.",
             requests,
+            |batch| {
+                println!(
+                    "Batch progress: {}/{} completed, {} failed ({})",
+                    batch.request_counts.completed,
+                    batch.request_counts.total,
+                    batch.request_counts.failed,
+                    batch.status
+                );
+            },
         )
         .await?;
 

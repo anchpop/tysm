@@ -98,7 +98,17 @@ async fn main() -> anyhow::Result<()> {
     // Wait for batch to complete
     println!("Waiting for batch to complete...");
     println!("(This may take a while, up to 24 hours)");
-    let completed_batch = batch_client.wait_for_batch(&batch.id).await?;
+    let completed_batch = batch_client
+        .wait_for_batch(&batch.id, |batch| {
+            println!(
+                "Batch progress: {}/{} completed, {} failed ({})",
+                batch.request_counts.completed,
+                batch.request_counts.total,
+                batch.request_counts.failed,
+                batch.status
+            );
+        })
+        .await?;
     println!("Batch completed!");
 
     // Get batch results

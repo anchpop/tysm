@@ -1228,8 +1228,10 @@ impl ChatClient {
     pub async fn batch_chat<T: DeserializeOwned + JsonSchema>(
         &self,
         prompts: Vec<impl Into<String>>,
+        on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
-        self.batch_chat_with_system_prompt("", prompts).await
+        self.batch_chat_with_system_prompt("", prompts, on_progress)
+            .await
     }
 
     /// Send objects through the Batch API using `prompt` to render each object, returning
@@ -1239,12 +1241,13 @@ impl ChatClient {
         &self,
         items: &'a [I],
         prompt: impl Fn(&'a I) -> S,
+        on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<(&'a I, Result<T, IndividualChatError>)>, BatchChatError>
     where
         S: Into<String>,
         T: DeserializeOwned + JsonSchema,
     {
-        self.batch_chat_with_system_prompt_fn("", items, prompt)
+        self.batch_chat_with_system_prompt_fn("", items, prompt, on_progress)
             .await
     }
 
@@ -1256,6 +1259,7 @@ impl ChatClient {
         &self,
         system_prompt: impl Into<String> + Clone,
         prompts: Vec<impl Into<String>>,
+        on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
         let prompts = prompts
             .into_iter()
@@ -1270,7 +1274,7 @@ impl ChatClient {
             })
             .collect();
 
-        self.batch_chat_with_messages(prompts).await
+        self.batch_chat_with_messages(prompts, on_progress).await
     }
 
     /// Send objects through the Batch API with a shared system prompt, returning every
@@ -1280,6 +1284,7 @@ impl ChatClient {
         system_prompt: impl Into<String> + Clone,
         items: &'a [I],
         prompt: impl Fn(&'a I) -> S,
+        on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<(&'a I, Result<T, IndividualChatError>)>, BatchChatError>
     where
         S: Into<String>,
@@ -1287,7 +1292,7 @@ impl ChatClient {
     {
         let prompts = items.iter().map(&prompt).collect::<Vec<_>>();
         let results = self
-            .batch_chat_with_system_prompt(system_prompt, prompts)
+            .batch_chat_with_system_prompt(system_prompt, prompts, on_progress)
             .await?;
         Ok(items.iter().zip(results).collect())
     }
@@ -1299,6 +1304,7 @@ impl ChatClient {
     pub async fn batch_chat_with_messages<T: DeserializeOwned + JsonSchema>(
         &self,
         messages: Vec<Vec<ChatMessage>>,
+        on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
         let json_schema = JsonSchemaFormat::new::<T>();
 
@@ -1312,6 +1318,7 @@ impl ChatClient {
                     .into_iter()
                     .map(|m| (m, response_format.clone()))
                     .collect(),
+                on_progress,
             )
             .await?;
 
@@ -1338,12 +1345,13 @@ impl ChatClient {
         &self,
         items: &'a [I],
         messages: impl Fn(&'a I) -> Vec<ChatMessage>,
+        on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<(&'a I, Result<T, IndividualChatError>)>, BatchChatError>
     where
         T: DeserializeOwned + JsonSchema,
     {
         let messages = items.iter().map(messages).collect();
-        let results = self.batch_chat_with_messages(messages).await?;
+        let results = self.batch_chat_with_messages(messages, on_progress).await?;
         Ok(items.iter().zip(results).collect())
     }
 
@@ -1433,6 +1441,7 @@ impl ChatClient {
     pub async fn batch_chat_with_messages_raw(
         &self,
         prompts: Vec<(Vec<ChatMessage>, ResponseFormat)>,
+        on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<Result<String, IndividualChatError>>, BatchChatError> {
         use crate::batch::{BatchClient, BatchRequestItem};
 
@@ -1543,7 +1552,9 @@ impl ChatClient {
                 .await?
         };
 
-        let batch = batch_client.wait_for_batch(&batch.id).await?;
+        let batch = batch_client
+            .wait_for_batch(&batch.id, on_progress)
+            .await?;
 
         let results = batch_client.get_batch_results(&batch).await?;
 
@@ -2111,9 +2122,12 @@ async fn batch_fn_pairs_objects_and_uses_fallback_cache_without_network() {
         .with_cached_only();
     let items = vec!["alpha".to_string()];
     let results = client
-        .batch_chat_with_system_prompt_fn::<_, _, Answer>("return a value", &items, |item| {
-            item.clone()
-        })
+        .batch_chat_with_system_prompt_fn::<_, _, Answer>(
+            "return a value",
+            &items,
+            |item| item.clone(),
+            |_| {},
+        )
         .await
         .unwrap();
 
@@ -2181,7 +2195,12 @@ async fn batch_prefers_current_model_cache_over_fallback_cache() {
     let client = current.with_cache_fallback(fallback).with_cached_only();
     let items = vec!["alpha".to_string()];
     let results = client
-        .batch_chat_with_system_prompt_fn::<_, _, Answer>("return a value", &items, Clone::clone)
+        .batch_chat_with_system_prompt_fn::<_, _, Answer>(
+            "return a value",
+            &items,
+            Clone::clone,
+            |_| {},
+        )
         .await
         .unwrap();
 

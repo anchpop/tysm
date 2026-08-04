@@ -502,13 +502,18 @@ impl BatchClient {
         }
     }
 
-    /// Wait for a batch to complete.
-    pub async fn wait_for_batch(&self, batch_id: &str) -> Result<Batch, WaitForBatchError> {
+    /// Wait for a batch to complete, calling `on_progress` after every status poll.
+    pub async fn wait_for_batch(
+        &self,
+        batch_id: &str,
+        mut on_progress: impl FnMut(&Batch),
+    ) -> Result<Batch, WaitForBatchError> {
         let mut attempts = 0;
         let mut seconds_waited = 0;
 
         loop {
             let batch = self.get_batch_status(batch_id).await?;
+            on_progress(&batch);
 
             match batch.status {
                 BatchStatus::Completed => return Ok(batch),
