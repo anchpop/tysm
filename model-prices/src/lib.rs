@@ -211,10 +211,18 @@ const GPT_5_LONG_CONTEXT: u32 = 272_000;
 /// visible as a missing `.flex()` rather than hidden in a second table.
 pub const MODELS: &[ModelCost] = &[
     // Anthropic
+    //
+    // Both spellings of a point release are listed. The API's own ids use
+    // dashes (`claude-opus-4-5-20251101`), and with only the dotted spelling
+    // present the longest-prefix match falls back to the major version —
+    // billing Opus 4.5 at Opus 4's $15/$75 instead of $5/$25.
     model("claude-opus-4.5", 5.0, None, 25.0),
+    model("claude-opus-4-5", 5.0, None, 25.0),
     model("claude-opus-4.1", 15.0, None, 75.0),
+    model("claude-opus-4-1", 15.0, None, 75.0),
     model("claude-opus-4", 15.0, None, 75.0),
     model("claude-sonnet-4.5", 3.0, None, 15.0),
+    model("claude-sonnet-4-5", 3.0, None, 15.0),
     model("claude-sonnet-4", 3.0, None, 15.0),
     model("claude-haiku-4", 0.80, None, 4.0),
     model("claude-3-opus", 15.0, None, 75.0),
@@ -305,10 +313,12 @@ pub const MODELS: &[ModelCost] = &[
     model("gemini-2.0-flash-lite", 0.075, None, 0.30),
     // GPT-5 models
     //
-    // Every gpt-5.x model charges a long-context premium, but the rates above
-    // the threshold are filled in below only for the gpt-5.6 family. The
-    // others are known to carry a premium we have not recorded, and so
-    // under-bill requests with prompts over `GPT_5_LONG_CONTEXT`.
+    // Only the 5.6 family carries a `long_context` card here, because those
+    // are the rates we have. OpenAI states the 272k boundary for gpt-5.5 but
+    // we have not recorded what it charges past it, and whether the older
+    // 5.x models tier by prompt size at all is unconfirmed — so a long
+    // request on any of them bills at the short card. Filling these in is the
+    // first thing to check when refreshing this table.
     // "gpt-5.6" alias routes to gpt-5.6-sol
     model("gpt-5.6", 5.00, Some(0.50), 30.00)
         .flex(2.50, Some(0.25), 15.00)
@@ -484,6 +494,25 @@ mod tests {
             cost_of_call("gpt-5.6-terra", None, u),
             cost_of_call("gpt-5.6", None, u),
         );
+    }
+
+    /// A point release must not resolve to its major version. Prefix matching
+    /// makes that failure silent and expensive: `claude-opus-4-5-...` matching
+    /// `claude-opus-4` bills at 3x the real rate, and nothing about the result
+    /// looks wrong.
+    #[test]
+    fn dated_point_releases_resolve_to_the_point_release() {
+        for (id, expected) in [
+            ("claude-opus-4-5-20251101", "claude-opus-4-5"),
+            ("claude-opus-4.5", "claude-opus-4.5"),
+            ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
+            ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),
+            ("claude-opus-4-20250514", "claude-opus-4"),
+            ("claude-sonnet-4-20250514", "claude-sonnet-4"),
+        ] {
+            let got = price_of(id).map(|mc| mc.name);
+            assert_eq!(got, Some(expected), "{id} resolved to {got:?}");
+        }
     }
 
     /// The premium re-prices the entire request, and a prompt exactly at the
