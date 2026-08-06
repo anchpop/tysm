@@ -3,7 +3,7 @@ members = ["model-prices"]
 
 [package]
 name = "tysm"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 description = "Batteries-included Rust OpenAI Client"
 license = "MIT"
