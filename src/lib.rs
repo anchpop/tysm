@@ -49,7 +49,7 @@ pub mod cache;
 pub mod chat_completions;
 pub mod embeddings;
 pub mod files;
-mod model_prices;
+pub mod model_prices;
 mod schema;
 mod utils;
 

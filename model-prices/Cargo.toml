@@ -1,0 +1,14 @@
+[package]
+name = "model-prices"
+version = "0.1.0"
+edition = "2021"
+description = "Published per-token prices for hosted LLMs, as plain data"
+license = "MIT"
+homepage = "https://github.com/not-pizza/tysm"
+repository = "https://github.com/not-pizza/tysm"
+keywords = ["openai", "anthropic", "gemini", "pricing", "llm"]
+
+# Intentionally empty, and worth keeping that way: this crate is vendored into
+# builds (Android/Soong among them) that would otherwise have to vendor a
+# dependency tree alongside it just to multiply tokens by a rate.
+[dependencies]

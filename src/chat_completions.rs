@@ -53,6 +53,16 @@ pub struct ChatClient {
     /// This client's token consumption via the Batch API (as reported by the API). Tracked
     /// separately from `usage` because OpenAI bills batch requests at 50% of the standard price.
     pub batch_usage: RwLock<ChatUsage>,
+    /// Dollars billed so far, accumulated one request at a time.
+    ///
+    /// Kept beside the token counters rather than derived from them because a
+    /// model's rate can depend on a single request's prompt size (see
+    /// [`crate::model_prices::LongContext`]) — pricing the summed tokens of
+    /// many short requests would bill them all at the long-context premium.
+    ///
+    /// `None` once any request used a model we have no price for, since the
+    /// total is unknowable from then on.
+    pub spend: RwLock<Option<f64>>,
     /// The directory in which to cache responses to requests
     pub cache_directory: Option<PathBuf>,
 
@@ -758,6 +768,7 @@ impl ChatClient {
             lru: DashMap::new(),
             usage: RwLock::new(ChatUsage::default()),
             batch_usage: RwLock::new(ChatUsage::default()),
+            spend: RwLock::new(Some(0.0)),
             cache_directory: None,
             backup_cache_directory: None,
             service_tier: None,
@@ -1198,6 +1209,7 @@ impl ChatClient {
         let chat_response = self.chat_uncached(&chat_request).await?;
         let (result, usage) = process_result(chat_response.clone())?;
         *self.usage.write().unwrap() += usage;
+        self.record_spend(self.service_tier.as_deref(), usage, 1.0);
 
         // cache the response
         {
@@ -1552,9 +1564,7 @@ impl ChatClient {
                 .await?
         };
 
-        let batch = batch_client
-            .wait_for_batch(&batch.id, on_progress)
-            .await?;
+        let batch = batch_client.wait_for_batch(&batch.id, on_progress).await?;
 
         let results = batch_client.get_batch_results(&batch).await?;
 
@@ -1601,6 +1611,10 @@ impl ChatClient {
             for response in results.values() {
                 *batch_usage += response.usage;
             }
+        }
+        for response in results.values() {
+            // Batch pricing is a flat 50% of the standard (non-tier) price.
+            self.record_spend(None, response.usage, 0.5);
         }
 
         for (hash, (request, _)) in &requests_by_hash {
@@ -1780,11 +1794,27 @@ impl ChatClient {
     /// and may be out of date or unavailable for the model you're using.
     /// If you notice the prices being out of date, [please leave an issue](https://github.com/not-pizza/tysm)!
     pub fn cost(&self) -> Option<f64> {
-        let live =
-            crate::model_prices::cost(&self.model, self.service_tier.as_deref(), self.usage())?;
-        // Batch pricing is a flat 50% of the standard (non-tier) price.
-        let batch = crate::model_prices::cost(&self.model, None, self.batch_usage())? / 2.0;
-        Some(live + batch)
+        *self.spend.read().unwrap()
+    }
+
+    /// Price one request and add it to the running total, `discount` scaling
+    /// the result (the Batch API bills at half).
+    ///
+    /// Priced here, per request, rather than by pricing the accumulated token
+    /// counts later: a model with a long-context premium charges by how large
+    /// one prompt was, which the totals no longer remember.
+    fn record_spend(&self, service_tier: Option<&str>, usage: ChatUsage, discount: f64) {
+        let mut spend = self.spend.write().unwrap();
+        match crate::model_prices::cost_of_call(&self.model, service_tier, usage) {
+            Some(dollars) => {
+                if let Some(total) = spend.as_mut() {
+                    *total += dollars * discount;
+                }
+            }
+            // One unpriced request makes the total unknowable, and it stays
+            // that way — a later priced request must not resurrect it.
+            None => *spend = None,
+        }
     }
 }
 
@@ -1829,14 +1859,66 @@ fn cost_includes_batch_usage_at_half_price() {
         completion_token_details: None,
     };
 
-    *client.usage.write().unwrap() = usage;
+    client.record_spend(None, usage, 1.0);
     let live_only = client.cost().unwrap();
 
-    *client.batch_usage.write().unwrap() = usage;
+    client.record_spend(None, usage, 0.5);
     let with_batch = client.cost().unwrap();
 
     // The same usage again via the Batch API should cost exactly half as much more.
     assert!((with_batch - live_only * 1.5).abs() < 1e-9);
+}
+
+#[test]
+fn an_unpriced_request_makes_the_total_unknowable() {
+    let client = ChatClient::new("sk-test", "some-model-we-have-no-price-for");
+    let usage = ChatUsage {
+        prompt_tokens: 1_000,
+        completion_tokens: 1_000,
+        total_tokens: 2_000,
+        prompt_token_details: None,
+        completion_token_details: None,
+    };
+
+    // A client that has done nothing has spent nothing, whatever its model.
+    assert_eq!(client.cost(), Some(0.0));
+
+    client.record_spend(None, usage, 1.0);
+    assert_eq!(client.cost(), None);
+}
+
+/// The client accumulates dollars, not tokens, so a long run of short requests
+/// is never mistaken for one long-context request.
+#[test]
+fn spend_accumulates_per_request_not_from_summed_tokens() {
+    let client = ChatClient::new("sk-test", "gpt-5.6-luna");
+    let short = ChatUsage {
+        prompt_tokens: 50_000,
+        completion_tokens: 0,
+        total_tokens: 50_000,
+        prompt_token_details: None,
+        completion_token_details: None,
+    };
+
+    // Six 50k requests sum to 300k tokens, past luna's 272k threshold — but
+    // each was billed on its own at the cheap card: 0.3M @ $0.20 = $0.06.
+    for _ in 0..6 {
+        client.record_spend(None, short, 1.0);
+    }
+    let spent = client.cost().unwrap();
+    assert!((spent - 0.06).abs() < 1e-9, "{spent}");
+
+    // Those same 300k tokens arriving as a single request cross the threshold
+    // and cost twice as much.
+    let one_long = ChatUsage {
+        prompt_tokens: 300_000,
+        total_tokens: 300_000,
+        ..short
+    };
+    let fresh = ChatClient::new("sk-test", "gpt-5.6-luna");
+    fresh.record_spend(None, one_long, 1.0);
+    let spent_at_once = fresh.cost().unwrap();
+    assert!((spent_at_once - 0.12).abs() < 1e-9, "{spent_at_once}");
 }
 
 #[test]
