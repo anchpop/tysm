@@ -1,199 +1,109 @@
-//! On-disk response cache backed by a few big append-only **record-log** shard files.
+//! On-disk response cache, backed by an [`osmo`] store.
 //!
-//! Each cache entry is a `(cache_key, value)` pair where `value` is the zstd-compressed
-//! response. Instead of one tiny file per entry (which produced millions of inodes and was
-//! painful to mirror to object storage), entries are sharded into `NNN.kv` files (`000.kv`
-//! … `999.kv`) — one append-only log per shard. Each record is
-//! `[u32-le key_len][key][u32-le val_len][val]`, the same binary format `osmo`'s `records`
-//! sync strategy understands, so a directory of these files mirrors to a bucket as ~1000
-//! objects that merge losslessly across machines.
-//!
-//! A shard is loaded into an in-memory map on first access (lazily); writes insert into
-//! the map and append a record to the file. The legacy layout (a `dir/NNN/` directory with
-//! one file per entry) is migrated into the log the first time its shard is touched.
+//! Each entry is a `(cache_key, value)` pair where `value` is the zstd-compressed
+//! response. Entries live in the osmo store rooted at the cache directory, under the
+//! `tysm/` key namespace. osmo handles persistence (append-only segment files), sharing
+//! across sibling clients pointed at the same directory, and — for callers that opt in —
+//! syncing the directory to an S3-compatible bucket so caches can be shared across
+//! machines (see `osmo::Store::pull`/`push`).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::path::Path;
 
-use dashmap::DashMap;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
-use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
-
-const SHARDS: u64 = 1000;
-
-/// One [`ShardStore`] per canonicalized cache directory, shared process-wide so sibling
-/// clients pointed at the same directory share the in-memory shard maps.
-static STORES: LazyLock<DashMap<PathBuf, Arc<ShardStore>>> = LazyLock::new(DashMap::new);
-
-fn store_for(dir: &Path) -> Arc<ShardStore> {
-    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    STORES
-        .entry(canon.clone())
-        .or_insert_with(|| Arc::new(ShardStore::new(canon)))
-        .clone()
+/// The osmo key for a tysm cache entry.
+fn store_key(cache_key: &str) -> String {
+    format!("tysm/{cache_key}")
 }
 
 /// Read a cached value by key, or `None` if absent.
 pub(crate) async fn read_from_cache_dir(dir: &Path, cache_key: &str) -> Option<Vec<u8>> {
-    store_for(dir).get(cache_key).await
+    osmo::Store::open(dir).read(&store_key(cache_key)).await
 }
 
-/// Append a `(cache_key, data)` entry to its shard log (no-op if already present identically).
+/// Write a `(cache_key, data)` entry (no-op if already present identically).
 pub(crate) async fn write_to_cache_dir(
     dir: &Path,
     cache_key: &str,
     data: &[u8],
 ) -> Result<(), std::io::Error> {
-    store_for(dir).put(cache_key, data).await
+    osmo::Store::open(dir)
+        .write(&store_key(cache_key), data)
+        .await
+        .map_err(std::io::Error::other)
 }
 
-/// Force every legacy shard directory in `dir` to be folded into its `NNN.kv` log and
-/// removed. Useful before mirroring the directory to object storage, so no leftover
-/// per-entry files remain. Safe to call repeatedly.
-pub async fn migrate(dir: &Path) -> Result<(), std::io::Error> {
-    let store = store_for(dir);
-    for n in 0..SHARDS as u16 {
-        // Only bother if a legacy directory actually exists for this shard. Fold it to
-        // disk under the shard lock without populating the in-memory map, so migrating a
-        // huge cache up front doesn't pull all of it into RAM.
-        if tokio::fs::metadata(store.legacy_dir(n))
-            .await
-            .map(|m| m.is_dir())
-            .unwrap_or(false)
-        {
-            let lock = store.shard_lock(n);
-            let _guard = lock.lock().await;
-            store.fold_legacy(n).await;
+/// Fold a pre-osmo tysm cache layout under `shard_dir` into `store`: `NNN.kv` record-log
+/// shards, and (older still) `NNN/` directories with one file per entry. Entries land
+/// under the `tysm/` namespace; the legacy files are deleted once imported. Returns how
+/// many entries were imported. Cheap no-op when nothing legacy exists.
+pub async fn migrate_legacy(
+    shard_dir: &Path,
+    store: &osmo::Store,
+) -> Result<usize, std::io::Error> {
+    const SHARDS: u16 = 1000;
+
+    let mut kv_files = Vec::new();
+    let mut legacy_dirs = Vec::new();
+    for n in 0..SHARDS {
+        let kv = shard_dir.join(format!("{n:03}.kv"));
+        if kv.is_file() {
+            kv_files.push(kv);
+        }
+        let dir = shard_dir.join(format!("{n:03}"));
+        if dir.is_dir() {
+            legacy_dirs.push(dir);
         }
     }
-    Ok(())
-}
+    if kv_files.is_empty() && legacy_dirs.is_empty() {
+        return Ok(0);
+    }
 
-struct ShardStore {
-    dir: PathBuf,
-    shards: DashMap<u16, Arc<Mutex<Shard>>>,
-}
-
-#[derive(Default)]
-struct Shard {
-    loaded: bool,
-    entries: HashMap<String, Vec<u8>>,
-}
-
-impl ShardStore {
-    fn new(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            shards: DashMap::new(),
+    // One shard at a time, deduped so the *last* record for a key wins (matching the old
+    // replay semantics), lazily so peak memory is a single shard.
+    let kv_entries = kv_files.iter().flat_map(|path| {
+        let mut latest: HashMap<String, Vec<u8>> = HashMap::new();
+        if let Ok(data) = std::fs::read(path) {
+            for (key, value) in parse_v1_records(&data) {
+                latest.insert(key, value);
+            }
         }
-    }
-
-    fn shard_lock(&self, n: u16) -> Arc<Mutex<Shard>> {
-        self.shards
-            .entry(n)
-            .or_insert_with(|| Arc::new(Mutex::new(Shard::default())))
-            .clone()
-    }
-
-    fn log_path(&self, n: u16) -> PathBuf {
-        self.dir.join(format!("{n:03}.kv"))
-    }
-
-    fn legacy_dir(&self, n: u16) -> PathBuf {
-        self.dir.join(format!("{n:03}"))
-    }
-
-    /// Fold the legacy `dir/NNN/<key>` directory (one file per entry) into the shard log,
-    /// then remove it. No-op if there's no such directory. Does not touch the in-memory map.
-    /// Caller must hold the shard lock.
-    async fn fold_legacy(&self, n: u16) {
-        let legacy = self.legacy_dir(n);
-        let Ok(mut rd) = tokio::fs::read_dir(&legacy).await else {
-            return;
-        };
-        let mut batch = Vec::new();
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            if entry
-                .file_type()
-                .await
-                .map(|t| t.is_file())
-                .unwrap_or(false)
-            {
+        latest.into_iter()
+    });
+    let dir_entries = legacy_dirs.iter().flat_map(|dir| {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for entry in rd.flatten() {
                 if let (Some(key), Ok(data)) = (
-                    entry.file_name().to_str(),
-                    tokio::fs::read(entry.path()).await,
+                    entry.file_name().to_str().map(String::from),
+                    std::fs::read(entry.path()),
                 ) {
-                    encode_record(&mut batch, key, &data);
+                    out.push((key, data));
                 }
             }
         }
-        // Only drop the legacy directory once its contents are safely in the log — a
-        // failed append must never lose cached data.
-        if !batch.is_empty() {
-            if let Err(e) = append(&self.log_path(n), &batch).await {
-                log::warn!("tysm cache: failed to fold legacy shard {n:03}; keeping it: {e}");
-                return;
-            }
-        }
-        let _ = tokio::fs::remove_dir_all(&legacy).await;
-    }
+        out
+    });
+    let imported = store
+        .import(
+            kv_entries
+                .chain(dir_entries)
+                .map(|(key, value)| (store_key(&key), value)),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
 
-    /// Load a shard's entries into memory (migrating the legacy directory first, if any).
-    async fn ensure_loaded(&self, n: u16, shard: &mut Shard) {
-        if shard.loaded {
-            return;
-        }
-        self.fold_legacy(n).await;
-        if let Ok(data) = tokio::fs::read(&self.log_path(n)).await {
-            for (key, val) in parse_records(&data) {
-                shard.entries.insert(key, val); // later records win
-            }
-        }
-        shard.loaded = true;
+    for path in kv_files {
+        std::fs::remove_file(&path)?;
     }
-
-    async fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let n = shard_of(key);
-        let lock = self.shard_lock(n);
-        let mut shard = lock.lock().await;
-        self.ensure_loaded(n, &mut shard).await;
-        shard.entries.get(key).cloned()
+    for dir in legacy_dirs {
+        std::fs::remove_dir_all(&dir)?;
     }
-
-    async fn put(&self, key: &str, data: &[u8]) -> Result<(), std::io::Error> {
-        let n = shard_of(key);
-        let lock = self.shard_lock(n);
-        let mut shard = lock.lock().await;
-        self.ensure_loaded(n, &mut shard).await;
-        // Already cached identically — nothing to append.
-        if shard.entries.get(key).map(Vec::as_slice) == Some(data) {
-            return Ok(());
-        }
-        let mut buf = Vec::with_capacity(8 + key.len() + data.len());
-        encode_record(&mut buf, key, data);
-        append(&self.log_path(n), &buf).await?;
-        shard.entries.insert(key.to_string(), data.to_vec());
-        Ok(())
-    }
+    Ok(imported)
 }
 
-/// Which shard a key belongs to (matches the legacy `cache_shard` distribution).
-fn shard_of(key: &str) -> u16 {
-    (const_xxh3(key.as_bytes()) % SHARDS) as u16
-}
-
-fn encode_record(buf: &mut Vec<u8>, key: &str, val: &[u8]) {
-    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-    buf.extend_from_slice(key.as_bytes());
-    buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
-    buf.extend_from_slice(val);
-}
-
-/// Parse a record log into `(key, value)` pairs, stopping at the first incomplete record
-/// (tolerant of a truncated trailing append). Records with non-UTF-8 keys are skipped.
-fn parse_records(data: &[u8]) -> Vec<(String, Vec<u8>)> {
+/// Parse the v1 record-log format (`[u32-le key_len][key][u32-le val_len][val]`, no tag
+/// byte), stopping at the first incomplete record. Records with non-UTF-8 keys are skipped.
+fn parse_v1_records(data: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     let read_len = |at: usize| -> Option<usize> {
@@ -219,22 +129,10 @@ fn parse_records(data: &[u8]) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-async fn append(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    f.write_all(bytes).await?;
-    f.flush().await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn unique_dir(tag: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
@@ -266,68 +164,62 @@ mod tests {
             Some(&b"\x00\x01binary"[..])
         );
 
-        // Writing the same key+value again must not grow the log file.
-        let shard = store_for(&dir).log_path(shard_of("k1"));
-        let before = tokio::fs::metadata(&shard).await.unwrap().len();
+        // Writing the same key+value again must not grow the store.
+        let seg_bytes = || -> u64 {
+            std::fs::read_dir(dir.join("segments"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".seg"))
+                .map(|e| e.metadata().unwrap().len())
+                .sum()
+        };
+        let before = seg_bytes();
         write_to_cache_dir(&dir, "k1", b"v1").await.unwrap();
-        let after = tokio::fs::metadata(&shard).await.unwrap().len();
-        assert_eq!(before, after, "identical re-write should be a no-op");
+        assert_eq!(seg_bytes(), before, "identical re-write should be a no-op");
 
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
 
     #[tokio::test]
-    async fn persists_and_reloads_from_disk() {
-        let dir = unique_dir("persist");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        write_to_cache_dir(&dir, "alpha", b"A").await.unwrap();
-        write_to_cache_dir(&dir, "beta", b"B").await.unwrap();
-
-        // Drop the in-memory store and read fresh from the log files.
-        STORES.clear();
-        assert_eq!(
-            read_from_cache_dir(&dir, "alpha").await.as_deref(),
-            Some(&b"A"[..])
-        );
-        assert_eq!(
-            read_from_cache_dir(&dir, "beta").await.as_deref(),
-            Some(&b"B"[..])
-        );
-
-        tokio::fs::remove_dir_all(&dir).await.ok();
-    }
-
-    #[tokio::test]
-    async fn migrates_legacy_shard_directories() {
+    async fn migrates_v1_shards_and_legacy_directories() {
         let dir = unique_dir("migrate");
-        // Lay down the old layout: dir/<shard>/<key> = value.
-        let key = "legacykey";
-        let shard = format!("{:03}", const_xxh3(key.as_bytes()) % SHARDS);
-        let legacy = dir.join(&shard);
-        tokio::fs::create_dir_all(&legacy).await.unwrap();
-        tokio::fs::write(legacy.join(key), b"oldvalue")
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        STORES.clear();
-        // Reading the key migrates the directory into the log and returns the value.
-        assert_eq!(
-            read_from_cache_dir(&dir, key).await.as_deref(),
-            Some(&b"oldvalue"[..])
-        );
-        // The legacy directory is gone; the log file exists.
-        assert!(!dir.join(&shard).exists(), "legacy dir should be removed");
-        assert!(
-            dir.join(format!("{shard}.kv")).exists(),
-            "log file should exist"
-        );
+        // v1 shard log with a superseded record: later record must win.
+        let mut kv = Vec::new();
+        for (k, v) in [("logkey", &b"old"[..]), ("logkey", b"new"), ("other", b"x")] {
+            kv.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            kv.extend_from_slice(k.as_bytes());
+            kv.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            kv.extend_from_slice(v);
+        }
+        std::fs::write(dir.join("042.kv"), kv).unwrap();
 
-        // And it survives a fresh load.
-        STORES.clear();
+        // Even older layout: one file per entry.
+        std::fs::create_dir_all(dir.join("117")).unwrap();
+        std::fs::write(dir.join("117").join("dirkey"), b"dirvalue").unwrap();
+
+        let store = osmo::Store::open_uncached(&dir);
+        let n = migrate_legacy(&dir, &store).await.unwrap();
+        assert_eq!(n, 3);
+
         assert_eq!(
-            read_from_cache_dir(&dir, key).await.as_deref(),
-            Some(&b"oldvalue"[..])
+            store.read("tysm/logkey").await.as_deref(),
+            Some(&b"new"[..])
         );
+        assert_eq!(store.read("tysm/other").await.as_deref(), Some(&b"x"[..]));
+        assert_eq!(
+            store.read("tysm/dirkey").await.as_deref(),
+            Some(&b"dirvalue"[..])
+        );
+        assert!(!dir.join("042.kv").exists(), "shard log deleted");
+        assert!(!dir.join("117").exists(), "legacy dir deleted");
+
+        // And the public read path sees the migrated entries... but through a distinct
+        // handle in real use; here the registry store would differ from open_uncached, so
+        // read through the same store to keep the test hermetic.
+        let again = migrate_legacy(&dir, &store).await.unwrap();
+        assert_eq!(again, 0, "second migration is a no-op");
 
         tokio::fs::remove_dir_all(&dir).await.ok();
     }

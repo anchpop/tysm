@@ -1552,9 +1552,7 @@ impl ChatClient {
                 .await?
         };
 
-        let batch = batch_client
-            .wait_for_batch(&batch.id, on_progress)
-            .await?;
+        let batch = batch_client.wait_for_batch(&batch.id, on_progress).await?;
 
         let results = batch_client.get_batch_results(&batch).await?;
 
