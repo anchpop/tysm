@@ -17,6 +17,12 @@ keywords = [
 
 [features]
 default = ["dotenvy"]
+# Send a batch's uncached requests as ordinary live calls when there are few
+# enough of them (see `ChatClient::small_batch_threshold`). The Batch API costs
+# half as much but pays a fixed overhead — uploading the request file, waiting
+# for the queue — that dwarfs the saving on a handful of requests, and shows up
+# most on retries, where nearly everything is already cached.
+small-batch-optimization = []
 
 [dependencies]
 dotenvy = { version = "0.15.0", optional = true }

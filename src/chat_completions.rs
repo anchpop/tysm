@@ -74,6 +74,19 @@ pub struct ChatClient {
     /// Extra body to be provided when making requests
     pub extra_body: Option<serde_json::Value>,
 
+    /// How few uncached requests a batch may contain before it is sent as
+    /// ordinary live calls instead.
+    ///
+    /// The Batch API halves the price but pays a fixed cost in latency —
+    /// uploading the request file and waiting in the queue — which is worth it
+    /// for a thousand requests and absurd for five. Retries feel this most: once
+    /// most responses are cached, what remains is a handful of stragglers that
+    /// would otherwise wait on a whole batch round trip.
+    ///
+    /// Only consulted when the `small-batch-optimization` feature is enabled.
+    #[cfg(feature = "small-batch-optimization")]
+    pub small_batch_threshold: usize,
+
     /// Semaphore to limit the maximum number of concurrent requests
     pub semaphore: Semaphore,
 
@@ -738,6 +751,15 @@ pub enum IndividualChatError {
     /// The API refused to fulfill the request.
     #[error("The API refused to fulfill the request: `{0}`")]
     Refusal(String),
+
+    /// The request failed outright.
+    ///
+    /// Only produced when a batch's requests are sent live (see the
+    /// `small-batch-optimization` feature): a transport or API failure belongs
+    /// to that one request, and reporting it per-item keeps the live path's
+    /// result shape identical to the batch path's.
+    #[error("The request failed: `{0}`")]
+    Other(String),
 }
 
 impl ChatClient {
@@ -764,11 +786,21 @@ impl ChatClient {
             prompt_cache_key: None,
             reasoning_effort: None,
             extra_body: None,
+            #[cfg(feature = "small-batch-optimization")]
+            small_batch_threshold: 16,
             semaphore: Semaphore::new(100),
             http_client: crate::utils::pooled_client(),
             cached_only: false,
             cache_fallbacks: Vec::new(),
         }
+    }
+
+    /// How few uncached requests a batch may contain before it is sent as
+    /// ordinary live calls instead. Defaults to 16; zero disables the shortcut.
+    #[cfg(feature = "small-batch-optimization")]
+    pub fn with_small_batch_threshold(mut self, threshold: usize) -> Self {
+        self.small_batch_threshold = threshold;
+        self
     }
 
     /// Set the cache directory for the client.
@@ -1312,31 +1344,28 @@ impl ChatClient {
             json_schema: json_schema.clone(),
         };
 
-        let chat_responses = self
-            .batch_chat_with_messages_raw(
-                messages
-                    .into_iter()
-                    .map(|m| (m, response_format.clone()))
-                    .collect(),
-                on_progress,
-            )
-            .await?;
-
-        let chat_responses: Vec<Result<T, _>> = chat_responses
-            .into_iter()
-            .map(|chat_response| {
-                let chat_response = chat_response?;
-                Self::decode_json(&chat_response).map_err(|e| {
+        // Deserialization is handed *down* rather than applied to the results,
+        // so a response that does not fit the schema is never written to the
+        // cache. Mapping afterwards would cache it first and then reject it,
+        // making the failure permanent.
+        let schema = serde_json::to_string(&json_schema.schema).unwrap();
+        self.batch_chat_with_messages_raw_mapped(
+            messages
+                .into_iter()
+                .map(|m| (m, response_format.clone()))
+                .collect(),
+            on_progress,
+            move |raw| {
+                Self::decode_json(&raw).map_err(|error| {
                     IndividualChatError::ResponseNotConformantToSchema {
-                        error: e,
-                        response: chat_response.trim().to_string(),
-                        schema: serde_json::to_string(&json_schema.schema).unwrap(),
+                        error,
+                        response: raw.trim().to_string(),
+                        schema: schema.clone(),
                     }
                 })
-            })
-            .collect::<Vec<Result<_, IndividualChatError>>>();
-
-        Ok(chat_responses)
+            },
+        )
+        .await
     }
 
     /// Send objects through the Batch API using `messages` to build each conversation,
@@ -1443,6 +1472,25 @@ impl ChatClient {
         prompts: Vec<(Vec<ChatMessage>, ResponseFormat)>,
         on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<Result<String, IndividualChatError>>, BatchChatError> {
+        self.batch_chat_with_messages_raw_mapped(prompts, on_progress, Ok)
+            .await
+    }
+
+    /// Send a batch of chat requests, then map each response to a different
+    /// type. A response is cached only if its mapping succeeds.
+    ///
+    /// The mapping is taken as an argument, rather than applied by the caller
+    /// afterwards, for the same reason the live path does it
+    /// ([`Self::chat_with_messages_raw_mapped`]): a response we cannot use is a
+    /// response we must not cache. Caching first and rejecting second would
+    /// serve the bad response back as a hit on every future run, so re-running
+    /// could never repair it.
+    async fn batch_chat_with_messages_raw_mapped<T>(
+        &self,
+        prompts: Vec<(Vec<ChatMessage>, ResponseFormat)>,
+        on_progress: impl FnMut(&crate::batch::Batch),
+        map_response: impl Fn(String) -> Result<T, IndividualChatError>,
+    ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
         use crate::batch::{BatchClient, BatchRequestItem};
 
         info!("Starting batch chat with {} prompts", prompts.len());
@@ -1451,10 +1499,19 @@ impl ChatClient {
         let mut misses = Vec::new();
         for (index, (messages, response_format)) in prompts.into_iter().enumerate() {
             let request = self.request_for_messages(messages, response_format);
-            if let Some(cached) = self.cached_batch_content(&request).await {
-                output[index] = Some(cached);
-            } else {
-                misses.push((index, request));
+            // A cached entry that will not map is not an answer, so it counts as
+            // a miss and gets asked again; the fresh response then replaces it.
+            // Returning the stored failure instead would make it permanent — the
+            // request would never be retried and re-running could never repair
+            // it. This also heals entries written before caching was gated on
+            // the mapping succeeding.
+            match self
+                .cached_batch_content(&request)
+                .await
+                .map(|cached| cached.and_then(&map_response))
+            {
+                Some(Ok(value)) => output[index] = Some(Ok(value)),
+                Some(Err(_)) | None => misses.push((index, request)),
             }
         }
 
@@ -1463,6 +1520,40 @@ impl ChatClient {
         }
         if self.cached_only {
             return Err(BatchChatError::CacheMiss(misses.len()));
+        }
+
+        // Too few uncached requests to be worth a batch's fixed overhead: send
+        // them live. Decided on `misses`, not the caller's total, so a retry
+        // whose responses are nearly all cached skips the queue entirely.
+        #[cfg(feature = "small-batch-optimization")]
+        if misses.len() <= self.small_batch_threshold {
+            info!(
+                "Sending {} uncached request(s) live instead of batching (threshold {})",
+                misses.len(),
+                self.small_batch_threshold
+            );
+            // Uses the *mapped* live call so this path caches on exactly the
+            // same condition as the batch path — a response that fails the
+            // caller's mapping is not written to the cache either way.
+            let mapped = |raw: String| map_response(raw).map_err(ChatError::ChatError);
+            for (index, request) in misses {
+                let result = self
+                    .chat_with_messages_raw_mapped(
+                        request.messages.clone(),
+                        request.response_format.clone(),
+                        &mapped,
+                    )
+                    .await;
+                output[index] = Some(match result {
+                    Ok(response) => Ok(response),
+                    // A live failure becomes this request's error rather than
+                    // failing the whole call, matching what the batch path
+                    // returns per item.
+                    Err(ChatError::ChatError(e)) => Err(e),
+                    Err(e) => Err(IndividualChatError::Other(e.to_string())),
+                });
+            }
+            return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
         let batch_client = BatchClient::from(self);
@@ -1601,27 +1692,49 @@ impl ChatClient {
             }
         }
 
-        for (hash, (request, _)) in &requests_by_hash {
-            let custom_id = format!("request-{hash}");
-            if let Some(response) = results.get(&custom_id) {
-                self.cache_batch_response(request, response).await?;
-            }
-        }
+        let requests_by_custom_id: HashMap<String, &ChatRequest> = requests_by_hash
+            .iter()
+            .map(|(hash, (request, _))| (format!("request-{hash}"), request))
+            .collect();
 
-        for (index, custom_id, _) in indexed_custom_ids {
-            let response = results
-                .get(&custom_id)
-                .ok_or(BatchChatError::CustomIdNotFound(custom_id.clone()))?;
+        // Read, map, and cache each response in one pass.
+        //
+        // The single pass is the point: the cache write lives inside the branch
+        // where the mapped value is `Ok`, so there is no reachable path that
+        // stores a response nobody could read. Splitting the write into its own
+        // loop would leave it correct only as long as someone kept the two in
+        // step — and caching a refusal, or content that breaks the schema, makes
+        // that failure permanent, since it comes back as a hit forever and never
+        // becomes a miss to retry.
+        //
+        // Mapping once also matters because `ChatMessageResponse::content`
+        // consumes `self`: doing it twice would clone every message twice.
+        let mut mapped: HashMap<String, Result<T, IndividualChatError>> =
+            HashMap::with_capacity(results.len());
+        for (custom_id, response) in &results {
             let choice = response
                 .choices
                 .first()
-                .ok_or(BatchChatError::BatchNoChoices(custom_id))?;
+                .ok_or_else(|| BatchChatError::BatchNoChoices(custom_id.clone()))?;
+            let value = choice
+                .message
+                .clone()
+                .content()
+                .map_err(IndividualChatError::Refusal)
+                .and_then(&map_response);
+            if value.is_ok() {
+                if let Some(request) = requests_by_custom_id.get(custom_id) {
+                    self.cache_batch_response(request, response).await?;
+                }
+            }
+            mapped.insert(custom_id.clone(), value);
+        }
+
+        for (index, custom_id, _) in indexed_custom_ids {
             output[index] = Some(
-                choice
-                    .message
-                    .clone()
-                    .content()
-                    .map_err(IndividualChatError::Refusal),
+                mapped
+                    .remove(&custom_id)
+                    .ok_or(BatchChatError::CustomIdNotFound(custom_id))?,
             );
         }
 
