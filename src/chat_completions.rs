@@ -1645,7 +1645,34 @@ impl ChatClient {
 
         let batch = batch_client.wait_for_batch(&batch.id, on_progress).await?;
 
-        let results = batch_client.get_batch_results(&batch).await?;
+        // A batch's status flips to Completed slightly before its output file
+        // settles, and a read in that window returns a file missing some (or
+        // all) results — which would surface as CustomIdNotFound even though
+        // the requests succeeded (the IDs are provably in the file minutes
+        // later). When expected IDs are absent, re-fetch with backoff instead
+        // of failing; a genuinely absent ID still errors below once the
+        // retries are exhausted.
+        let expected: std::collections::HashSet<&str> = indexed_custom_ids
+            .iter()
+            .map(|(_, custom_id, _)| custom_id.as_str())
+            .collect();
+        let mut results = batch_client.get_batch_results(&batch).await?;
+        for delay_secs in [2u64, 5, 15, 30, 60] {
+            let returned: std::collections::HashSet<&str> =
+                results.iter().map(|r| r.custom_id.as_str()).collect();
+            let missing = expected.difference(&returned).count();
+            if missing == 0 {
+                break;
+            }
+            info!(
+                "batch {} results are missing {missing} of {} custom ids — \
+                 output file may still be settling, re-fetching in {delay_secs}s",
+                batch.id,
+                expected.len(),
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            results = batch_client.get_batch_results(&batch).await?;
+        }
 
         let results = results
             .into_iter()
