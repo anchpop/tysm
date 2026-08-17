@@ -236,7 +236,9 @@ pub const MODELS: &[ModelCost] = &[
     model("claude-opus-4-7", 5.0, None, 25.0),
     model("claude-opus-4-6", 5.0, None, 25.0),
     model("claude-sonnet-4-6", 3.0, None, 15.0),
-    // Introductory pricing through 2026-08-31; becomes 3.0/15.0 on 2026-09-01.
+    // Launched as introductory pricing through 2026-08-31, scheduled to become
+    // 3.0/15.0 on 2026-09-01 — but Anthropic made 2.0/10.0 the permanent
+    // standard price instead, so that increase will not happen.
     // https://platform.claude.com/docs/en/about-claude/pricing
     model("claude-sonnet-5", 2.0, None, 10.0),
     model("claude-haiku-4-5", 1.0, None, 5.0),
@@ -288,10 +290,18 @@ pub const MODELS: &[ModelCost] = &[
     model("gemini-3.5-flash", 1.50, Some(0.15), 9.00)
         .flex(0.75, Some(0.08), 4.50)
         .priority(2.70, Some(0.27), 16.20),
-    // Released 2026-07-21 (google blog: gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber)
-    model("gemini-3.6-flash", 1.50, Some(0.15), 7.50)
-        .flex(0.75, Some(0.075), 3.75)
-        .priority(2.70, Some(0.27), 13.50),
+    // Released 2026-07-21 (google blog: gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber).
+    // Cut to match Gemini 3.7 Flash's introductory rate on 2026-08-13/14; both
+    // revert to 1.50/0.15/7.50 on 2027-01-01.
+    model("gemini-3.6-flash", 0.75, Some(0.075), 3.75)
+        .flex(0.375, Some(0.0375), 1.875)
+        .priority(1.35, Some(0.135), 6.75),
+    // Released 2026-08-13/14. Introductory pricing through 2026-12-31;
+    // becomes 1.50/0.15/7.50 on 2027-01-01.
+    // https://venturebeat.com/technology/googles-gemini-3-7-flash-targets-coding-and-agents-with-a-50-introductory-price-cut
+    model("gemini-3.7-flash", 0.75, Some(0.075), 3.75)
+        .flex(0.375, Some(0.0375), 1.875)
+        .priority(1.35, Some(0.135), 6.75),
     model("gemini-3.5-flash-lite", 0.30, Some(0.03), 2.50)
         .flex(0.15, Some(0.015), 1.25)
         .priority(0.54, Some(0.054), 4.50),
@@ -396,7 +406,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-07-30";
+pub const RATE_CARD_VERSION: &str = "2026-08-17";
 
 /// The cost in dollars of a **single** request.
 ///
