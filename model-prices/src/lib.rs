@@ -236,8 +236,9 @@ pub const MODELS: &[ModelCost] = &[
     model("claude-opus-4-7", 5.0, None, 25.0),
     model("claude-opus-4-6", 5.0, None, 25.0),
     model("claude-sonnet-4-6", 3.0, None, 15.0),
-    // Introductory pricing through 2026-08-31; becomes 3.0/15.0 on 2026-09-01.
-    // https://platform.claude.com/docs/en/about-claude/pricing
+    // Introductory pricing ($2.0/$10.0), originally slated to rise to
+    // 3.0/15.0 on 2026-09-01; Anthropic made it the permanent price instead,
+    // confirmed 2026-08-24. https://platform.claude.com/docs/en/about-claude/pricing
     model("claude-sonnet-5", 2.0, None, 10.0),
     model("claude-haiku-4-5", 1.0, None, 5.0),
     // OpenAI
@@ -320,21 +321,26 @@ pub const MODELS: &[ModelCost] = &[
     // request on any of them bills at the short card. Filling these in is the
     // first thing to check when refreshing this table.
     // "gpt-5.6" alias routes to gpt-5.6-sol
-    model("gpt-5.6", 5.00, Some(0.50), 30.00)
-        .flex(2.50, Some(0.25), 15.00)
-        .priority(10.00, Some(1.00), 60.00)
+    //
+    // Cut 20%/33% on 2026-08-21, temporary for ~3 months (from 5.00/0.50/30.00
+    // standard, 10.00/1.00/45.00 long context); flex and priority are not
+    // separately confirmed but kept at their standing 0.5x/2x multiples of
+    // standard. https://openai.com/index/advancing-the-price-performance-frontier-with-gpt-5-6/
+    model("gpt-5.6", 4.00, Some(0.40), 20.00)
+        .flex(2.00, Some(0.20), 10.00)
+        .priority(8.00, Some(0.80), 40.00)
         .long_context(
-            long(GPT_5_LONG_CONTEXT, 10.00, Some(1.00), 45.00)
-                .flex(5.00, Some(0.50), 22.50)
-                .priority(20.00, Some(2.00), 90.00),
+            long(GPT_5_LONG_CONTEXT, 8.00, Some(0.80), 30.00)
+                .flex(4.00, Some(0.40), 15.00)
+                .priority(16.00, Some(1.60), 60.00),
         ),
-    model("gpt-5.6-sol", 5.00, Some(0.50), 30.00)
-        .flex(2.50, Some(0.25), 15.00)
-        .priority(10.00, Some(1.00), 60.00)
+    model("gpt-5.6-sol", 4.00, Some(0.40), 20.00)
+        .flex(2.00, Some(0.20), 10.00)
+        .priority(8.00, Some(0.80), 40.00)
         .long_context(
-            long(GPT_5_LONG_CONTEXT, 10.00, Some(1.00), 45.00)
-                .flex(5.00, Some(0.50), 22.50)
-                .priority(20.00, Some(2.00), 90.00),
+            long(GPT_5_LONG_CONTEXT, 8.00, Some(0.80), 30.00)
+                .flex(4.00, Some(0.40), 15.00)
+                .priority(16.00, Some(1.60), 60.00),
         ),
     // Cut 20% on 2026-07-30 (from 2.50/0.25/15.00); https://openai.com/pricing
     model("gpt-5.6-terra", 2.00, Some(0.20), 12.00)
@@ -396,7 +402,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-07-30";
+pub const RATE_CARD_VERSION: &str = "2026-08-24";
 
 /// The cost in dollars of a **single** request.
 ///
