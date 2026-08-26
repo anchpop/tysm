@@ -5,7 +5,7 @@
 //!
 //! See the examples/ for more information.
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -511,7 +511,31 @@ impl BatchClient {
         let mut seconds_waited = 0;
 
         loop {
-            let batch = self.get_batch_status(batch_id).await?;
+            let batch = match self.get_batch_status(batch_id).await {
+                Ok(batch) => batch,
+                Err(GetBatchStatusError::RequestError(e)) => {
+                    // A batch can run for hours, and every status poll opens a
+                    // fresh connection — so sooner or later one poll hits a
+                    // dropped connection, a DNS blip, or a laptop switching
+                    // networks. That must not abort a wait that is already
+                    // hours deep: the batch itself is fine on OpenAI's side.
+                    // Treat transport errors as "still waiting" and poll
+                    // again; the timeout below still bounds the total wait,
+                    // and errors the API itself reports still propagate.
+                    if seconds_waited >= 86400 {
+                        return Err(WaitForBatchError::BatchTimeout(batch_id.to_string()));
+                    }
+                    let delay = 30;
+                    warn!(
+                        "transient error polling batch {batch_id} status, \
+                         retrying in {delay} seconds: {e}"
+                    );
+                    sleep(Duration::from_secs(delay)).await;
+                    seconds_waited += delay;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             on_progress(&batch);
 
             match batch.status {
@@ -560,7 +584,29 @@ impl BatchClient {
             .as_ref()
             .ok_or_else(|| GetBatchResultsError::BatchNoOutputFile(batch.id.clone()))?;
 
-        let content = self.files_client.download_file(output_file_id).await?;
+        // By the time we're downloading results the batch has already
+        // succeeded — hours of work may be sitting behind this one request,
+        // so a transient transport failure gets a few retries rather than
+        // bubbling up and discarding the wait.
+        let content = {
+            let mut attempt = 0;
+            loop {
+                match self.files_client.download_file(output_file_id).await {
+                    Ok(content) => break content,
+                    Err(FilesError::RequestError(e)) if attempt < 5 => {
+                        attempt += 1;
+                        let delay = 10 * attempt;
+                        warn!(
+                            "transient error downloading results for batch {}, \
+                             retrying in {delay} seconds: {e}",
+                            batch.id
+                        );
+                        sleep(Duration::from_secs(delay)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
         debug!("Got results for batch {}: {}", batch.id, content);
 
         let mut results = Vec::new();
