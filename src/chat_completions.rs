@@ -762,6 +762,9 @@ pub enum IndividualChatError {
     Other(String),
 }
 
+/// Live requests in flight at once when a batch is sent live instead.
+const LIVE_CONCURRENCY: usize = 16;
+
 impl ChatClient {
     /// Create a new [`ChatClient`].
     /// If the API key is in the environment, you can use the [`Self::from_env`] method instead.
@@ -1522,36 +1525,53 @@ impl ChatClient {
             return Err(BatchChatError::CacheMiss(misses.len()));
         }
 
-        // Too few uncached requests to be worth a batch's fixed overhead: send
-        // them live. Decided on `misses`, not the caller's total, so a retry
-        // whose responses are nearly all cached skips the queue entirely.
-        #[cfg(feature = "small-batch-optimization")]
-        if misses.len() <= self.small_batch_threshold {
+        // Send the uncached requests live instead of batching: always under
+        // `no-batch`, or under `small-batch-optimization` when there are too
+        // few to be worth a batch's fixed overhead. Decided on `misses`, not
+        // the caller's total, so a retry whose responses are nearly all cached
+        // skips the queue entirely.
+        #[cfg(feature = "no-batch")]
+        let send_live = true;
+        #[cfg(all(feature = "small-batch-optimization", not(feature = "no-batch")))]
+        let send_live = misses.len() <= self.small_batch_threshold;
+        #[cfg(not(any(feature = "no-batch", feature = "small-batch-optimization")))]
+        let send_live = false;
+        if send_live {
             info!(
-                "Sending {} uncached request(s) live instead of batching (threshold {})",
-                misses.len(),
-                self.small_batch_threshold
+                "Sending {} uncached request(s) live instead of batching",
+                misses.len()
             );
             // Uses the *mapped* live call so this path caches on exactly the
             // same condition as the batch path — a response that fails the
             // caller's mapping is not written to the cache either way.
             let mapped = |raw: String| map_response(raw).map_err(ChatError::ChatError);
-            for (index, request) in misses {
-                let result = self
-                    .chat_with_messages_raw_mapped(
-                        request.messages.clone(),
-                        request.response_format.clone(),
-                        &mapped,
-                    )
+            let mapped = &mapped;
+            use futures::StreamExt as _;
+            let results: Vec<(usize, Result<T, IndividualChatError>)> =
+                futures::stream::iter(misses)
+                    .map(|(index, request)| async move {
+                        let result = self
+                            .chat_with_messages_raw_mapped(
+                                request.messages.clone(),
+                                request.response_format.clone(),
+                                mapped,
+                            )
+                            .await;
+                        let result = match result {
+                            Ok(response) => Ok(response),
+                            // A live failure becomes this request's error rather
+                            // than failing the whole call, matching what the
+                            // batch path returns per item.
+                            Err(ChatError::ChatError(e)) => Err(e),
+                            Err(e) => Err(IndividualChatError::Other(e.to_string())),
+                        };
+                        (index, result)
+                    })
+                    .buffer_unordered(LIVE_CONCURRENCY)
+                    .collect()
                     .await;
-                output[index] = Some(match result {
-                    Ok(response) => Ok(response),
-                    // A live failure becomes this request's error rather than
-                    // failing the whole call, matching what the batch path
-                    // returns per item.
-                    Err(ChatError::ChatError(e)) => Err(e),
-                    Err(e) => Err(IndividualChatError::Other(e.to_string())),
-                });
+            for (index, result) in results {
+                output[index] = Some(result);
             }
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
