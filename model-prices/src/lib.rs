@@ -236,7 +236,8 @@ pub const MODELS: &[ModelCost] = &[
     model("claude-opus-4-7", 5.0, None, 25.0),
     model("claude-opus-4-6", 5.0, None, 25.0),
     model("claude-sonnet-4-6", 3.0, None, 15.0),
-    // Introductory pricing through 2026-08-31; becomes 3.0/15.0 on 2026-09-01.
+    // $2/$10 launch pricing is now permanent — the previously scheduled
+    // 2026-09-01 increase to 3.0/15.0 was cancelled.
     // https://platform.claude.com/docs/en/about-claude/pricing
     model("claude-sonnet-5", 2.0, None, 10.0),
     model("claude-haiku-4-5", 1.0, None, 5.0),
@@ -292,6 +293,11 @@ pub const MODELS: &[ModelCost] = &[
     model("gemini-3.6-flash", 1.50, Some(0.15), 7.50)
         .flex(0.75, Some(0.075), 3.75)
         .priority(2.70, Some(0.27), 13.50),
+    // Introductory pricing through 2026-12-31; becomes 1.50/0.15/7.50 on
+    // 2027-01-01. https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-3-7-flash/
+    model("gemini-3.7-flash", 0.75, Some(0.075), 3.75)
+        .flex(0.375, Some(0.0375), 1.875)
+        .priority(1.35, Some(0.135), 6.75),
     model("gemini-3.5-flash-lite", 0.30, Some(0.03), 2.50)
         .flex(0.15, Some(0.015), 1.25)
         .priority(0.54, Some(0.054), 4.50),
@@ -319,22 +325,24 @@ pub const MODELS: &[ModelCost] = &[
     // 5.x models tier by prompt size at all is unconfirmed — so a long
     // request on any of them bills at the short card. Filling these in is the
     // first thing to check when refreshing this table.
+    // Cut over 20% on 2026-08-21, promotional through at least 2026-11-21
+    // (from 5.00/0.50/30.00); https://openai.com/index/gpt-5-6/
     // "gpt-5.6" alias routes to gpt-5.6-sol
-    model("gpt-5.6", 5.00, Some(0.50), 30.00)
-        .flex(2.50, Some(0.25), 15.00)
-        .priority(10.00, Some(1.00), 60.00)
+    model("gpt-5.6", 4.00, Some(0.40), 20.00)
+        .flex(2.00, Some(0.20), 10.00)
+        .priority(8.00, Some(0.80), 40.00)
         .long_context(
-            long(GPT_5_LONG_CONTEXT, 10.00, Some(1.00), 45.00)
-                .flex(5.00, Some(0.50), 22.50)
-                .priority(20.00, Some(2.00), 90.00),
+            long(GPT_5_LONG_CONTEXT, 8.00, Some(0.80), 30.00)
+                .flex(4.00, Some(0.40), 15.00)
+                .priority(16.00, Some(1.60), 60.00),
         ),
-    model("gpt-5.6-sol", 5.00, Some(0.50), 30.00)
-        .flex(2.50, Some(0.25), 15.00)
-        .priority(10.00, Some(1.00), 60.00)
+    model("gpt-5.6-sol", 4.00, Some(0.40), 20.00)
+        .flex(2.00, Some(0.20), 10.00)
+        .priority(8.00, Some(0.80), 40.00)
         .long_context(
-            long(GPT_5_LONG_CONTEXT, 10.00, Some(1.00), 45.00)
-                .flex(5.00, Some(0.50), 22.50)
-                .priority(20.00, Some(2.00), 90.00),
+            long(GPT_5_LONG_CONTEXT, 8.00, Some(0.80), 30.00)
+                .flex(4.00, Some(0.40), 15.00)
+                .priority(16.00, Some(1.60), 60.00),
         ),
     // Cut 20% on 2026-07-30 (from 2.50/0.25/15.00); https://openai.com/pricing
     model("gpt-5.6-terra", 2.00, Some(0.20), 12.00)
@@ -396,7 +404,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-07-30";
+pub const RATE_CARD_VERSION: &str = "2026-08-31";
 
 /// The cost in dollars of a **single** request.
 ///
