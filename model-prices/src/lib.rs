@@ -236,10 +236,15 @@ pub const MODELS: &[ModelCost] = &[
     model("claude-opus-4-7", 5.0, None, 25.0),
     model("claude-opus-4-6", 5.0, None, 25.0),
     model("claude-sonnet-4-6", 3.0, None, 15.0),
-    // Introductory pricing through 2026-08-31; becomes 3.0/15.0 on 2026-09-01.
+    // The $2/$10 introductory rate, originally announced through 2026-08-31
+    // with a scheduled increase to $3/$15 on 2026-09-01, was made permanent —
+    // the increase will not occur.
     // https://platform.claude.com/docs/en/about-claude/pricing
     model("claude-sonnet-5", 2.0, None, 10.0),
     model("claude-haiku-4-5", 1.0, None, 5.0),
+    // Checked 2026-09-07: https://platform.claude.com/docs/en/about-claude/pricing
+    model("claude-fable-5-1", 10.0, None, 50.0),
+    model("claude-mythos-5-1", 10.0, None, 50.0),
     // OpenAI
     // Copied from https://platform.openai.com/docs/pricing on 2026-03-17
     model("gpt-4.1", 2.00, Some(0.50), 8.00),
@@ -261,6 +266,14 @@ pub const MODELS: &[ModelCost] = &[
     model("gpt-4o-mini-search-preview", 0.15, None, 0.60),
     model("gpt-4o-search-preview", 2.50, None, 10.00),
     model("computer-use-preview", 3.00, None, 12.00),
+    // Released 2026-09-03. Flex and priority tiers unconfirmed as of
+    // 2026-09-07 — filling these in is the next thing to check here.
+    model("gpt-6-astra", 10.00, Some(1.00), 50.00).long_context(long(
+        272_000,
+        20.00,
+        Some(2.00),
+        75.00,
+    )),
     // Google Gemini
     //
     // Gemini sells the same tiers OpenAI does, and the cheap one carries most
@@ -288,10 +301,25 @@ pub const MODELS: &[ModelCost] = &[
     model("gemini-3.5-flash", 1.50, Some(0.15), 9.00)
         .flex(0.75, Some(0.08), 4.50)
         .priority(2.70, Some(0.27), 16.20),
-    // Released 2026-07-21 (google blog: gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber)
-    model("gemini-3.6-flash", 1.50, Some(0.15), 7.50)
-        .flex(0.75, Some(0.075), 3.75)
-        .priority(2.70, Some(0.27), 13.50),
+    // Released 2026-07-21 at 1.50/7.50 (google blog:
+    // gemini-3-6-flash-3-5-flash-lite-3-5-flash-cyber). Google put it on
+    // introductory pricing when gemini-3.7-flash launched (2026-08-13) and
+    // gemini-3.8-flash shares the same rate — all three revert to
+    // 1.50/0.15/7.50 (flex 0.75/0.075/3.75, priority 2.70/0.27/13.50) on
+    // 2027-01-01. Checked 2026-09-07.
+    model("gemini-3.6-flash", 0.75, Some(0.075), 3.75)
+        .flex(0.375, Some(0.0375), 1.875)
+        .priority(1.35, Some(0.135), 6.75),
+    // Released 2026-08-13, same introductory rate as gemini-3.6-flash; see
+    // that entry's comment for the 2027-01-01 reversion.
+    model("gemini-3.7-flash", 0.75, Some(0.075), 3.75)
+        .flex(0.375, Some(0.0375), 1.875)
+        .priority(1.35, Some(0.135), 6.75),
+    // Released 2026-09-02, same introductory rate as gemini-3.6-flash; see
+    // that entry's comment for the 2027-01-01 reversion.
+    model("gemini-3.8-flash", 0.75, Some(0.075), 3.75)
+        .flex(0.375, Some(0.0375), 1.875)
+        .priority(1.35, Some(0.135), 6.75),
     model("gemini-3.5-flash-lite", 0.30, Some(0.03), 2.50)
         .flex(0.15, Some(0.015), 1.25)
         .priority(0.54, Some(0.054), 4.50),
@@ -396,7 +424,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-07-30";
+pub const RATE_CARD_VERSION: &str = "2026-09-07";
 
 /// The cost in dollars of a **single** request.
 ///
