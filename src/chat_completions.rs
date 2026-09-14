@@ -775,6 +775,9 @@ pub enum IndividualChatError {
 /// Live requests in flight at once when a batch is sent live instead.
 const LIVE_CONCURRENCY: usize = 16;
 
+/// Cache lookups in flight at once while a batch is checked against the cache.
+const CACHE_LOOKUP_CONCURRENCY: usize = 32;
+
 impl ChatClient {
     /// Create a new [`ChatClient`].
     /// If the API key is in the environment, you can use the [`Self::from_env`] method instead.
@@ -1512,19 +1515,33 @@ impl ChatClient {
 
         let mut output = (0..prompts.len()).map(|_| None).collect::<Vec<_>>();
         let mut misses = Vec::new();
-        for (index, (messages, response_format)) in prompts.into_iter().enumerate() {
-            let request = self.request_for_messages(messages, response_format);
-            // A cached entry that will not map is not an answer, so it counts as
-            // a miss and gets asked again; the fresh response then replaces it.
-            // Returning the stored failure instead would make it permanent — the
-            // request would never be retried and re-running could never repair
-            // it. This also heals entries written before caching was gated on
-            // the mapping succeeding.
-            match self
-                .cached_batch_content(&request)
-                .await
-                .map(|cached| cached.and_then(&map_response))
-            {
+        // Cache lookups run concurrently: each one walks this client's cache and
+        // then every fallback cache, and a mostly-warm batch of tens of
+        // thousands of prompts spends its whole life here if they are awaited
+        // one at a time. `buffered` (not `buffer_unordered`) keeps results in
+        // prompt order so `misses` stays ordered too.
+        use futures::StreamExt as _;
+        let map_response = &map_response;
+        let mut lookups = futures::stream::iter(prompts.into_iter().enumerate())
+            .map(|(index, (messages, response_format))| async move {
+                let request = self.request_for_messages(messages, response_format);
+                // A cached entry that will not map is not an answer, so it counts as
+                // a miss and gets asked again; the fresh response then replaces it.
+                // Returning the stored failure instead would make it permanent — the
+                // request would never be retried and re-running could never repair
+                // it. This also heals entries written before caching was gated on
+                // the mapping succeeding.
+                let cached = self
+                    .cached_batch_content(&request)
+                    .await
+                    .map(|cached| cached.and_then(map_response));
+                (index, request, cached)
+            })
+            .buffered(CACHE_LOOKUP_CONCURRENCY);
+        // Consumed as results arrive rather than collected, so a hit's request
+        // is dropped as soon as it is known to be one.
+        while let Some((index, request, cached)) = lookups.next().await {
+            match cached {
                 Some(Ok(value)) => output[index] = Some(Ok(value)),
                 Some(Err(_)) | None => misses.push((index, request)),
             }
@@ -1558,7 +1575,6 @@ impl ChatClient {
             // caller's mapping is not written to the cache either way.
             let mapped = |raw: String| map_response(raw).map_err(ChatError::ChatError);
             let mapped = &mapped;
-            use futures::StreamExt as _;
             let results: Vec<(usize, Result<T, IndividualChatError>)> =
                 futures::stream::iter(misses)
                     .map(|(index, request)| async move {
@@ -1784,7 +1800,7 @@ impl ChatClient {
                 .clone()
                 .content()
                 .map_err(IndividualChatError::Refusal)
-                .and_then(&map_response);
+                .and_then(map_response);
             if value.is_ok() {
                 if let Some(request) = requests_by_custom_id.get(custom_id) {
                     self.cache_batch_response(request, response).await?;
