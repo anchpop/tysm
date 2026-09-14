@@ -1518,8 +1518,9 @@ impl ChatClient {
         // Cache lookups run concurrently: each one walks this client's cache and
         // then every fallback cache, and a mostly-warm batch of tens of
         // thousands of prompts spends its whole life here if they are awaited
-        // one at a time. `buffered` (not `buffer_unordered`) keeps results in
-        // prompt order so `misses` stays ordered too.
+        // one at a time. Unordered so one slow lookup never holds up the rest;
+        // `output` is indexed and `misses` is re-sorted, so nothing downstream
+        // can tell.
         use futures::StreamExt as _;
         let map_response = &map_response;
         let mut lookups = futures::stream::iter(prompts.into_iter().enumerate())
@@ -1537,7 +1538,7 @@ impl ChatClient {
                     .map(|cached| cached.and_then(map_response));
                 (index, request, cached)
             })
-            .buffered(CACHE_LOOKUP_CONCURRENCY);
+            .buffer_unordered(CACHE_LOOKUP_CONCURRENCY);
         // Consumed as results arrive rather than collected, so a hit's request
         // is dropped as soon as it is known to be one.
         while let Some((index, request, cached)) = lookups.next().await {
@@ -1546,6 +1547,7 @@ impl ChatClient {
                 Some(Err(_)) | None => misses.push((index, request)),
             }
         }
+        misses.sort_by_key(|(index, _)| *index);
 
         if misses.is_empty() {
             return Ok(output.into_iter().map(Option::unwrap).collect());
