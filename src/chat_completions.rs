@@ -614,6 +614,44 @@ impl std::ops::Add for CompletionTokenDetails {
     }
 }
 
+/// How many times a live chat request is attempted before its error is returned.
+const LIVE_REQUEST_ATTEMPTS: u32 = 4;
+
+/// Whether an API error is one a later, identical request could succeed at.
+///
+/// The flex service tier answers `flex_unavailable` whenever OpenAI has no
+/// spare capacity; rate limits and server faults are the same shape of
+/// problem. In each case the request is fine and only the moment is wrong.
+fn is_transient_api_error(error: &OpenAiError) -> bool {
+    let code = error.code.as_deref().unwrap_or_default();
+    matches!(
+        code,
+        "flex_unavailable" | "resource_unavailable" | "rate_limit_exceeded" | "server_error"
+    ) || matches!(
+        error.r#type.as_str(),
+        "resource_unavailable" | "rate_limit_error" | "server_error"
+    )
+}
+
+/// How long to wait before retrying `error`, or `None` when retrying it would
+/// fail the same way however many times it is tried.
+///
+/// A transport error is usually a pooled keep-alive connection the server has
+/// already closed, surfacing on its next use; reconnecting fixes it at once.
+/// Capacity frees up on a scale of minutes rather than milliseconds, so those
+/// errors wait far longer. Anything else - a malformed request, a schema the
+/// model cannot satisfy - is returned as is.
+fn retry_delay(error: &ChatError, attempt: u32) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    match error {
+        ChatError::RequestError(_) => Some(Duration::from_secs(1 << attempt)),
+        ChatError::ApiError(error, _) if is_transient_api_error(error) => {
+            Some(Duration::from_secs(15 << (attempt - 1)))
+        }
+        _ => None,
+    }
+}
+
 /// Errors that can occur when interacting with the ChatGPT API.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -1233,8 +1271,36 @@ impl ChatClient {
         if self.cached_only {
             return Err(ChatError::CacheMiss);
         }
-        let chat_response = self.chat_uncached(&chat_request).await?;
-        let (result, usage) = process_result(chat_response.clone())?;
+        let (chat_response, result, usage) = {
+            let mut attempt = 1;
+            loop {
+                let outcome = match self.chat_uncached(&chat_request).await {
+                    Ok(response) => process_result.clone()(response.clone())
+                        .map(|(result, usage)| (response, result, usage)),
+                    Err(error) => Err(error),
+                };
+                match outcome {
+                    Ok(outcome) => break outcome,
+                    Err(error) => {
+                        match retry_delay(&error, attempt)
+                            .filter(|_| attempt < LIVE_REQUEST_ATTEMPTS)
+                        {
+                            Some(delay) => {
+                                warn!(
+                                    "Chat request to {} failed on attempt \
+                                     {attempt}/{LIVE_REQUEST_ATTEMPTS} ({error}), retrying in {}s",
+                                    self.model,
+                                    delay.as_secs()
+                                );
+                                tokio::time::sleep(delay).await;
+                                attempt += 1;
+                            }
+                            None => return Err(error),
+                        }
+                    }
+                }
+            }
+        };
         *self.usage.write().unwrap() += usage;
 
         // cache the response
@@ -2381,4 +2447,58 @@ async fn batch_prefers_current_model_cache_over_fallback_cache() {
         .unwrap();
 
     assert_eq!(results[0].1.as_ref().unwrap().value, "current");
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    fn api_error(r#type: &str, code: Option<&str>) -> ChatError {
+        ChatError::ApiError(
+            OpenAiError {
+                r#type: r#type.to_owned(),
+                code: code.map(str::to_owned),
+                message: "message".to_owned(),
+                param: None,
+            },
+            "request".to_owned(),
+        )
+    }
+
+    #[test]
+    fn capacity_errors_are_retried_and_wait_longer_than_a_reconnect() {
+        // The flex tier's "out of capacity" answer is the case this exists for.
+        let flex = api_error("resource_unavailable", Some("flex_unavailable"));
+        let delay = retry_delay(&flex, 1).expect("flex_unavailable is retryable");
+        assert_eq!(delay.as_secs(), 15);
+        // Backoff grows, because capacity frees up over minutes.
+        assert_eq!(retry_delay(&flex, 2).unwrap().as_secs(), 30);
+        assert_eq!(retry_delay(&flex, 3).unwrap().as_secs(), 60);
+    }
+
+    #[test]
+    fn rate_limits_and_server_faults_are_retried() {
+        for error in [
+            api_error("rate_limit_error", Some("rate_limit_exceeded")),
+            api_error("server_error", None),
+            api_error("resource_unavailable", None),
+        ] {
+            assert!(retry_delay(&error, 1).is_some(), "should retry: {error:?}");
+        }
+    }
+
+    #[test]
+    fn a_bad_request_is_never_retried() {
+        // A request the API rejects on its merits fails the same way forever.
+        for error in [
+            api_error("invalid_request_error", Some("context_length_exceeded")),
+            api_error("invalid_request_error", None),
+        ] {
+            assert!(
+                retry_delay(&error, 1).is_none(),
+                "should not retry: {error:?}"
+            );
+        }
+        assert!(retry_delay(&ChatError::NoChoices, 1).is_none());
+    }
 }
