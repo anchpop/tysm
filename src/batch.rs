@@ -5,7 +5,7 @@
 //!
 //! See the examples/ for more information.
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -92,6 +92,12 @@ pub enum GetBatchStatusError {
     #[error("OpenAI API error: {0}")]
     OpenAiError(#[from] OpenAiError),
 }
+
+/// How many *consecutive* failed status polls end a wait. Isolated failures
+/// reset the count, so this bounds only a sustained outage — roughly 25
+/// minutes with the backoff below, after which the batch is left running for
+/// a later call to resume.
+const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 10;
 
 /// Errors that can occur when waiting for a batch to complete.
 #[derive(Error, Debug)]
@@ -509,9 +515,64 @@ impl BatchClient {
         mut on_progress: impl FnMut(&Batch),
     ) -> Result<Batch, WaitForBatchError> {
         let mut seconds_waited = 0;
+        let mut failed_polls = 0u32;
 
         loop {
-            let batch = self.get_batch_status(batch_id).await?;
+            let batch = match self.get_batch_status(batch_id).await {
+                Ok(batch) => {
+                    failed_polls = 0;
+                    batch
+                }
+                Err(
+                    e @ (GetBatchStatusError::RequestError(_)
+                    | GetBatchStatusError::JsonParseError(..)),
+                ) => {
+                    // A batch can run for hours, and every status poll opens a
+                    // fresh connection — so sooner or later one poll hits a
+                    // dropped connection, a DNS blip, or a laptop switching
+                    // networks. A gateway in front of the API can also answer
+                    // mid-outage with a plain-text "upstream connect error"
+                    // body, which surfaces here as a JSON parse failure rather
+                    // than a transport one; it means the same thing. Neither
+                    // must abort a wait that is already hours deep: the batch
+                    // itself is fine on OpenAI's side. Treat both as "still
+                    // waiting" and poll again; errors the API itself reports
+                    // (OpenAiError) still propagate immediately.
+                    //
+                    // Only *consecutive* failures count toward giving up, so
+                    // isolated blips are free however long the wait runs, but
+                    // an API that is genuinely down or has changed shape ends
+                    // the wait in minutes instead of hanging for a day. Giving
+                    // up is cheap: the batch keeps running server-side and a
+                    // later call resumes it rather than resubmitting the work.
+                    failed_polls += 1;
+                    if failed_polls >= MAX_CONSECUTIVE_POLL_FAILURES {
+                        warn!(
+                            "giving up on batch {batch_id} after {failed_polls} consecutive \
+                             failed status polls; the batch is still running and can be resumed"
+                        );
+                        return Err(e.into());
+                    }
+                    if seconds_waited >= 86400 {
+                        return Err(WaitForBatchError::BatchTimeout(batch_id.to_string()));
+                    }
+                    // Back off as the failures pile up, so a struggling API is
+                    // not hammered every 30 seconds while it recovers.
+                    let delay = (30 * u64::from(failed_polls)).min(300);
+                    let cause = std::error::Error::source(&e)
+                        .map(|s| format!(": {s}"))
+                        .unwrap_or_default();
+                    warn!(
+                        "transient error polling batch {batch_id} status \
+                         ({failed_polls}/{MAX_CONSECUTIVE_POLL_FAILURES}), \
+                         retrying in {delay} seconds: {e}{cause}"
+                    );
+                    sleep(Duration::from_secs(delay)).await;
+                    seconds_waited += delay;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             on_progress(&batch);
 
             match batch.status {
@@ -560,7 +621,29 @@ impl BatchClient {
             .as_ref()
             .ok_or_else(|| GetBatchResultsError::BatchNoOutputFile(batch.id.clone()))?;
 
-        let content = self.files_client.download_file(output_file_id).await?;
+        // By the time we're downloading results the batch has already
+        // succeeded — hours of work may be sitting behind this one request,
+        // so a transient transport failure gets a few retries rather than
+        // bubbling up and discarding the wait.
+        let content = {
+            let mut attempt = 0;
+            loop {
+                match self.files_client.download_file(output_file_id).await {
+                    Ok(content) => break content,
+                    Err(FilesError::RequestError(e)) if attempt < 5 => {
+                        attempt += 1;
+                        let delay = 10 * attempt;
+                        warn!(
+                            "transient error downloading results for batch {}, \
+                             retrying in {delay} seconds: {e}",
+                            batch.id
+                        );
+                        sleep(Duration::from_secs(delay)).await;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
         debug!("Got results for batch {}: {}", batch.id, content);
 
         let mut results = Vec::new();
