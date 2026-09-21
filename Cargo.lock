@@ -908,7 +908,8 @@ dependencies = [
 [[package]]
 name = "osmo"
 version = "0.2.0"
-source = "git+https://github.com/anchpop/osmo#d82edc991542b400a5c56c1832ea8f0aca951be4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70f0e61c2e364a9acc133e1bb7ba28c6066498c36873bfc054e461e1a00489f4"
 dependencies = [
  "dashmap",
  "futures",
