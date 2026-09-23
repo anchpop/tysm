@@ -1667,15 +1667,22 @@ impl ChatClient {
                     .wait_for_batch(&batch.id, &mut on_progress)
                     .await?;
             }
-            self.harvest_batch(
-                &batch_client,
-                &batch,
-                true,
-                &mut misses,
-                &mut output,
-                map_response,
-            )
-            .await?;
+            // An old batch whose output file is gone (OpenAI keeps them for
+            // thirty days) is worth nothing, not a reason to stop: its
+            // requests are simply still misses.
+            if let Err(error) = self
+                .harvest_batch(
+                    &batch_client,
+                    &batch,
+                    true,
+                    &mut misses,
+                    &mut output,
+                    map_response,
+                )
+                .await
+            {
+                warn!("could not harvest batch {}: {error}", batch.id);
+            }
         }
         if misses.is_empty() {
             return Ok(output.into_iter().map(Option::unwrap).collect());
@@ -2977,5 +2984,50 @@ mod retry_tests {
         assert!(!network[2].contains("alpha"));
         assert!(network[3].contains(&remaining_hash));
         assert_eq!(client.batch_usage().total_tokens, 30);
+    }
+
+    #[cfg(any(feature = "small-batch-optimization", feature = "no-batch"))]
+    #[tokio::test]
+    async fn unreadable_output_file_of_an_old_batch_is_a_miss_not_an_error() {
+        let mut client = ChatClient::new("unused", "gpt-4o-mini");
+        #[cfg(feature = "small-batch-optimization")]
+        {
+            client = client.with_small_batch_threshold(usize::MAX);
+        }
+        let prompts = vec![(vec![ChatMessage::user("alpha")], ResponseFormat::Text)];
+        let requests = vec![(
+            0,
+            client.request_for_messages(prompts[0].0.clone(), ResponseFormat::Text),
+        )];
+        let batch = batch_json(
+            "completed",
+            Some("gone"),
+            &ChatClient::batch_hash(&requests),
+        );
+        let (url, task) = server(vec![
+            (
+                "GET /v1/batches ",
+                serde_json::json!({"object":"list", "data":[batch], "has_more":false}).to_string(),
+            ),
+            (
+                "GET /v1/files/gone/content ",
+                "not a result line".to_owned(),
+            ),
+            (
+                "POST /v1/chat/completions ",
+                response_json("live").to_string(),
+            ),
+        ])
+        .await;
+        client.base_url = url;
+        let results = client
+            .batch_chat_with_messages_raw(prompts, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            ["live"]
+        );
+        task.await.unwrap();
     }
 }
