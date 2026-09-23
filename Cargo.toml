@@ -3,7 +3,7 @@ members = ["model-prices"]
 
 [package]
 name = "tysm"
-version = "0.22.0"
+version = "0.22.1"
 edition = "2021"
 description = "Batteries-included Rust OpenAI Client"
 license = "MIT"
@@ -43,7 +43,7 @@ thiserror = "2.0.9"
 tynm = "0.1.10"
 lru = "0.12.5"
 schemars = { version = "1.0.1", features = ["preserve_order"] }
-tokio = { version = "1.21.2", features = ["fs"] }
+tokio = { version = "1.21.2", features = ["fs", "time"] }
 tokio-util = { version = "0.7.10", features = ["codec"] }
 url = "2.5.4"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "const_xxh3"] }
