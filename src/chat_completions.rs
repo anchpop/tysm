@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
-use crate::batch::{BatchResponseItem, BatchStatus};
+use crate::batch::{Batch, BatchClient, BatchRequestItem, BatchStatus};
 use crate::schema::OpenAiTransform;
 use crate::utils::{api_key, OpenAiApiKeyError};
 use crate::OpenAiError;
@@ -1003,10 +1003,7 @@ impl ChatClient {
     /// # use tysm::chat_completions::ChatClient;
     /// #  let client = {
     /// #     let my_api = url::Url::parse("https://g7edusstdonmn3vxdh3qdypkrq0wzttx.lambda-url.us-east-1.on.aws/v1/").unwrap();
-    /// #     ChatClient {
-    /// #         base_url: my_api,
-    /// #         ..ChatClient::from_env("gpt-4o").unwrap()
-    /// #     }
+    /// #     ChatClient::from_env("gpt-4o").unwrap().with_url(my_api.to_string())
     /// # };
     ///
     /// #[derive(serde::Deserialize, Debug, schemars::JsonSchema)]
@@ -1042,10 +1039,7 @@ impl ChatClient {
     /// # use tysm::chat_completions::ChatClient;
     /// #  let client = {
     /// #     let my_api = url::Url::parse("https://g7edusstdonmn3vxdh3qdypkrq0wzttx.lambda-url.us-east-1.on.aws/v1/").unwrap();
-    /// #     ChatClient {
-    /// #         base_url: my_api,
-    /// #         ..ChatClient::from_env("gpt-4o").unwrap()
-    /// #     }
+    /// #     ChatClient::from_env("gpt-4o").unwrap().with_url(my_api.to_string())
     /// # };
     ///
     /// #[derive(serde::Deserialize, Debug, schemars::JsonSchema)]
@@ -1083,10 +1077,7 @@ impl ChatClient {
     /// # use tysm::chat_completions::ChatClient;
     /// #  let client = {
     /// #     let my_api = url::Url::parse("https://g7edusstdonmn3vxdh3qdypkrq0wzttx.lambda-url.us-east-1.on.aws/v1/").unwrap();
-    /// #     ChatClient {
-    /// #         base_url: my_api,
-    /// #         ..ChatClient::from_env("gpt-4o").unwrap()
-    /// #     }
+    /// #     ChatClient::from_env("gpt-4o").unwrap().with_url(my_api.to_string())
     /// # };
     ///
     /// #[derive(serde::Deserialize, Debug, schemars::JsonSchema)]
@@ -1575,11 +1566,9 @@ impl ChatClient {
     async fn batch_chat_with_messages_raw_mapped<T>(
         &self,
         prompts: Vec<(Vec<ChatMessage>, ResponseFormat)>,
-        on_progress: impl FnMut(&crate::batch::Batch),
+        mut on_progress: impl FnMut(&crate::batch::Batch),
         map_response: impl Fn(String) -> Result<T, IndividualChatError>,
     ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
-        use crate::batch::{BatchClient, BatchRequestItem};
-
         info!("Starting batch chat with {} prompts", prompts.len());
 
         let mut output = (0..prompts.len()).map(|_| None).collect::<Vec<_>>();
@@ -1648,6 +1637,50 @@ impl ChatClient {
         let send_live = misses.len() <= self.small_batch_threshold;
         #[cfg(not(any(feature = "no-batch", feature = "small-batch-optimization")))]
         let send_live = false;
+        let batch_client = BatchClient::from(self);
+        let existing = match self.find_batch_by_hash(&batch_client, &misses).await {
+            Ok(existing) => existing,
+            // Live mode must work against an endpoint that has no Batch API at
+            // all; there is nothing to harvest there.
+            Err(error) if send_live => {
+                warn!("could not look for an existing batch, sending live: {error}");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(mut batch) = existing {
+            if !batch.status.is_terminal() {
+                if send_live && batch.status != BatchStatus::Cancelling {
+                    warn!(
+                        "no-batch mode: cancelling in-flight batch {} for these requests \
+                         and harvesting its completed results",
+                        batch.id
+                    );
+                    // The listing may be stale: a batch that finished in the
+                    // meantime rejects cancellation, and its results are
+                    // exactly what the wait below returns.
+                    if let Err(error) = batch_client.cancel_batch(&batch.id).await {
+                        warn!("could not cancel batch {}: {error}", batch.id);
+                    }
+                }
+                batch = batch_client
+                    .wait_for_batch(&batch.id, &mut on_progress)
+                    .await?;
+            }
+            self.harvest_batch(
+                &batch_client,
+                &batch,
+                true,
+                &mut misses,
+                &mut output,
+                map_response,
+            )
+            .await?;
+        }
+        if misses.is_empty() {
+            return Ok(output.into_iter().map(Option::unwrap).collect());
+        }
+
         if send_live {
             info!(
                 "Sending {} uncached request(s) live instead of batching",
@@ -1687,220 +1720,195 @@ impl ChatClient {
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
-        let batch_client = BatchClient::from(self);
+        // Never resubmit the successful portion of a partial batch.
+        let batch = self.submit_batch(&batch_client, &misses).await?;
+        let batch = batch_client
+            .wait_for_batch(&batch.id, &mut on_progress)
+            .await?;
+        self.harvest_batch(
+            &batch_client,
+            &batch,
+            false,
+            &mut misses,
+            &mut output,
+            map_response,
+        )
+        .await?;
+        if let Some((_, request)) = misses.first() {
+            return Err(BatchChatError::CustomIdNotFound(Self::batch_custom_id(
+                request,
+            )));
+        }
+        Ok(output.into_iter().map(Option::unwrap).collect())
+    }
 
-        let (indexed_custom_ids, requests) = misses
+    fn batch_request_hash(request: &ChatRequest) -> u64 {
+        const_xxh3(serde_json::to_string(request).unwrap().as_bytes())
+    }
+
+    fn batch_custom_id(request: &ChatRequest) -> String {
+        format!("request-{}", Self::batch_request_hash(request))
+    }
+
+    fn batch_hash(misses: &[(usize, ChatRequest)]) -> String {
+        misses
+            .iter()
+            .map(|(_, request)| Self::batch_request_hash(request))
+            .collect::<HashSet<_>>()
             .into_iter()
-            .map(|(index, request)| {
-                let request_str = serde_json::to_string(&request).unwrap();
-                let request_hash = const_xxh3(request_str.as_bytes());
-                let custom_id = format!("request-{}", request_hash);
-                (
-                    (index, custom_id.clone(), request_hash),
-                    (
-                        request_hash,
-                        (
-                            request.clone(),
-                            BatchRequestItem::new_chat(custom_id, request),
-                        ),
-                    ),
-                )
+            .fold(0u64, u64::wrapping_add)
+            .to_string()
+    }
+
+    async fn find_batch_by_hash(
+        &self,
+        client: &BatchClient,
+        misses: &[(usize, ChatRequest)],
+    ) -> Result<Option<Batch>, BatchChatError> {
+        let hash = Self::batch_hash(misses);
+        Ok(client.list_batches().await?.into_iter().find(|batch| {
+            batch.status != BatchStatus::Failed
+                && batch.metadata.as_ref().and_then(|m| m.get("request_hash")) == Some(&hash)
+        }))
+    }
+
+    async fn submit_batch(
+        &self,
+        client: &BatchClient,
+        misses: &[(usize, ChatRequest)],
+    ) -> Result<Batch, BatchChatError> {
+        let requests = misses
+            .iter()
+            .map(|(_, request)| {
+                let id = Self::batch_custom_id(request);
+                (id.clone(), BatchRequestItem::new_chat(id, request.clone()))
             })
-            .unzip::<_, _, Vec<_>, HashMap<_, _>>();
-        let requests_by_hash = requests;
-        let requests = requests_by_hash
-            .values()
-            .map(|(_, item)| item.clone())
+            .collect::<HashMap<_, _>>()
+            .into_values()
             .collect::<Vec<_>>();
-
-        let hashes = indexed_custom_ids
-            .iter()
-            .map(|(_, _, hash)| *hash)
-            .collect::<HashSet<_>>();
-        let request_hash = hashes
-            .into_iter()
-            .fold(0, |acc: u64, hash: u64| acc.wrapping_add(hash));
-
-        // list the batches to see if we already have a batch for this request
-        let all_batches = batch_client.list_batches().await?;
-        let batch = all_batches
-            .iter()
-            .find(|batch| {
-                let still_active = [
-                    BatchStatus::Completed,
-                    BatchStatus::InProgress,
-                    BatchStatus::Validating,
-                    BatchStatus::Finalizing,
-                ]
-                .contains(&batch.status);
-                if !still_active {
-                    return false;
-                }
-
-                batch
-                    .metadata
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_default()
-                    .get("request_hash")
-                    .map(|s| s == &request_hash.to_string())
-                    .unwrap_or_default()
-            })
-            .cloned();
-
-        // If the batch already exists, use it. Otherwise, create a new one.
-        let batch = if let Some(batch) = batch {
-            info!("Reusing existing batch");
-            batch
-        } else {
-            info!("No batch with matching hash found found, creating a new one");
-            // Create the batch content
-            let content = batch_client.create_batch_content(&requests);
-
-            // Upload the content directly
-            let file_obj = batch_client
-                .files_client
-                .upload_bytes("batch_request", content, crate::files::FilePurpose::Batch)
-                .await?;
-
-            batch_client
-                .create_batch(
-                    file_obj.id,
-                    std::collections::HashMap::from([(
-                        "request_hash".to_string(),
-                        request_hash.to_string(),
-                    )]),
-                )
-                .await?
-        };
-
-        let batch = batch_client.wait_for_batch(&batch.id, on_progress).await?;
-
-        // A batch's status flips to Completed slightly before its output file
-        // settles, and a read in that window returns a file missing some (or
-        // all) results — which would surface as CustomIdNotFound even though
-        // the requests succeeded (the IDs are provably in the file minutes
-        // later). When expected IDs are absent, re-fetch with backoff instead
-        // of failing; a genuinely absent ID still errors below once the
-        // retries are exhausted.
-        let expected: std::collections::HashSet<&str> = indexed_custom_ids
-            .iter()
-            .map(|(_, custom_id, _)| custom_id.as_str())
-            .collect();
-        let mut results = batch_client.get_batch_results(&batch).await?;
-        for delay_secs in [2u64, 5, 15, 30, 60] {
-            let returned: std::collections::HashSet<&str> =
-                results.iter().map(|r| r.custom_id.as_str()).collect();
-            let missing = expected.difference(&returned).count();
-            if missing == 0 {
-                break;
-            }
-            info!(
-                "batch {} results are missing {missing} of {} custom ids — \
-                 output file may still be settling, re-fetching in {delay_secs}s",
-                batch.id,
-                expected.len(),
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-            results = batch_client.get_batch_results(&batch).await?;
-        }
-
-        let results = results
-            .into_iter()
-            .map(
-                |BatchResponseItem {
-                     id: _,
-                     custom_id,
-                     response,
-                     error,
-                 }| {
-                    if let Some(error) = error {
-                        return Err(BatchChatError::BatchItemError(error));
-                    }
-                    // in this case, we assume that response is not None
-                    let response = response.unwrap().body;
-                    let response: ChatResponseOrError = serde_json::from_value(response.clone())
-                        .map_err(|e| BatchChatError::ApiParseError {
-                            error: e,
-                            response: response.to_string(),
-                        })?;
-
-                    Ok((custom_id, response))
-                },
+        let content = client.create_batch_content(&requests);
+        let file = client
+            .files_client
+            .upload_bytes("batch_request", content, crate::files::FilePurpose::Batch)
+            .await?;
+        Ok(client
+            .create_batch(
+                file.id,
+                HashMap::from([("request_hash".to_owned(), Self::batch_hash(misses))]),
             )
-            .collect::<Result<Vec<_>, _>>()?;
+            .await?)
+    }
 
-        let results = results
-            .into_iter()
-            .map(|(custom_id, response)| match response {
-                ChatResponseOrError::Response(response) => Ok((custom_id, response)),
-                ChatResponseOrError::Error(error) => {
-                    Err(BatchChatError::OpenAiError(error, custom_id))
+    /// Fill `output` from a terminal batch's results and drop the filled
+    /// slots from `misses`. With `retry_failures`, a failed item (an API
+    /// error, a refusal, or a response the caller's mapping rejects) stays a
+    /// miss so it is asked again; otherwise it is reported in its slot. The
+    /// first suits a batch found from an earlier run — a failure is never
+    /// cached, so the same batch would otherwise replay it forever — and the
+    /// second the batch this call just ran.
+    async fn harvest_batch<T>(
+        &self,
+        client: &BatchClient,
+        batch: &Batch,
+        retry_failures: bool,
+        misses: &mut Vec<(usize, ChatRequest)>,
+        output: &mut [Option<Result<T, IndividualChatError>>],
+        map_response: &impl Fn(String) -> Result<T, IndividualChatError>,
+    ) -> Result<(), BatchChatError> {
+        let expected = misses
+            .iter()
+            .map(|(_, r)| Self::batch_custom_id(r))
+            .collect::<HashSet<_>>();
+        let mut results = client.get_batch_results(batch).await?;
+        // Only completed files can still be settling. Explicit failures have IDs
+        // too, so they do not cause pointless file-download retries.
+        if batch.status == BatchStatus::Completed && batch.output_file_id.is_some() {
+            for delay_secs in [2u64, 5, 15, 30, 60] {
+                let returned = results
+                    .iter()
+                    .map(|r| r.custom_id.clone())
+                    .collect::<HashSet<_>>();
+                if expected.is_subset(&returned) {
+                    break;
                 }
-            })
-            .collect::<Result<HashMap<_, _>, BatchChatError>>()?;
-
-        // Each entry in `results` is one billed batch request; accumulate its reported
-        // usage. (A batch reattached from a previous run is counted again — the tokens
-        // were genuinely billed, just possibly already counted by the earlier process.)
-        {
-            let mut batch_usage = self.batch_usage.write().unwrap();
-            for response in results.values() {
-                *batch_usage += response.usage;
+                info!(
+                    "batch {} output file is missing IDs; re-fetching in {delay_secs}s",
+                    batch.id
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                results = client.get_batch_results(batch).await?;
             }
         }
-        for response in results.values() {
-            // Batch pricing is a flat 50% of the standard (non-tier) price.
+        // Every item the file mentions is resolved here, one way or the other:
+        // a well-formed success, or the reason it is not. Only IDs the file
+        // never mentions stay misses to be asked again.
+        let mut responses: HashMap<String, Result<ChatResponse, String>> = HashMap::new();
+        for item in results {
+            if !expected.contains(&item.custom_id) {
+                continue;
+            }
+            let response = match (item.error, item.response) {
+                (Some(error), _) => Err(error.to_string()),
+                (None, None) => Err("batch item had neither response nor error".to_owned()),
+                (None, Some(response)) => match serde_json::from_value(response.body) {
+                    Ok(ChatResponseOrError::Response(response)) => Ok(response),
+                    Ok(ChatResponseOrError::Error(error)) => Err(error.to_string()),
+                    Err(error) => Err(format!("malformed response: {error}")),
+                },
+            };
+            if let Err(error) = &response {
+                warn!("batch {} item {}: {error}", batch.id, item.custom_id);
+            }
+            responses.insert(item.custom_id, response);
+        }
+        // Account once per billed response, not per duplicate prompt or download.
+        for response in responses.values().flatten() {
+            *self.batch_usage.write().unwrap() += response.usage;
             self.record_spend(None, response.usage, 0.5);
         }
-
-        let requests_by_custom_id: HashMap<String, &ChatRequest> = requests_by_hash
-            .iter()
-            .map(|(hash, (request, _))| (format!("request-{hash}"), request))
-            .collect();
-
-        // Read, map, and cache each response in one pass.
-        //
-        // The single pass is the point: the cache write lives inside the branch
-        // where the mapped value is `Ok`, so there is no reachable path that
-        // stores a response nobody could read. Splitting the write into its own
-        // loop would leave it correct only as long as someone kept the two in
-        // step — and caching a refusal, or content that breaks the schema, makes
-        // that failure permanent, since it comes back as a hit forever and never
-        // becomes a miss to retry.
-        //
-        // Mapping once also matters because `ChatMessageResponse::content`
-        // consumes `self`: doing it twice would clone every message twice.
-        let mut mapped: HashMap<String, Result<T, IndividualChatError>> =
-            HashMap::with_capacity(results.len());
-        for (custom_id, response) in &results {
-            let choice = response
-                .choices
-                .first()
-                .ok_or_else(|| BatchChatError::BatchNoChoices(custom_id.clone()))?;
-            let value = choice
-                .message
-                .clone()
-                .content()
-                .map_err(IndividualChatError::Refusal)
-                .and_then(map_response);
-            if value.is_ok() {
-                if let Some(request) = requests_by_custom_id.get(custom_id) {
-                    self.cache_batch_response(request, response).await?;
-                }
+        let mut cached = HashSet::new();
+        for (index, request) in misses.iter() {
+            let id = Self::batch_custom_id(request);
+            // Mapped per slot: T need not be Clone, and duplicate prompts must
+            // not consume one another's response.
+            let value = match responses.get(&id) {
+                None => continue,
+                Some(Err(error)) => Err(IndividualChatError::Other(error.clone())),
+                Some(Ok(response)) => match response.choices.first() {
+                    None => Err(IndividualChatError::Other(
+                        "response had no choices".to_owned(),
+                    )),
+                    Some(choice) => {
+                        let value = choice
+                            .message
+                            .clone()
+                            .content()
+                            .map_err(IndividualChatError::Refusal)
+                            .and_then(map_response);
+                        // The cache write lives inside the `Ok` branch so a
+                        // refusal or a response that fails the caller's
+                        // mapping is never stored.
+                        if value.is_ok() && cached.insert(id) {
+                            self.cache_batch_response(request, response).await?;
+                        }
+                        value
+                    }
+                },
+            };
+            if value.is_err() && retry_failures {
+                continue;
             }
-            mapped.insert(custom_id.clone(), value);
+            output[*index] = Some(value);
         }
-
-        for (index, custom_id, _) in indexed_custom_ids {
-            output[index] = Some(
-                mapped
-                    .remove(&custom_id)
-                    .ok_or(BatchChatError::CustomIdNotFound(custom_id))?,
-            );
-        }
-
-        Ok(output.into_iter().map(Option::unwrap).collect())
+        info!(
+            "harvested {} of {} results from batch {} ({})",
+            cached.len(),
+            expected.len(),
+            batch.id,
+            batch.status
+        );
+        misses.retain(|(index, _)| output[*index].is_none());
+        Ok(())
     }
 
     async fn chat_cached<T>(
@@ -2659,5 +2667,315 @@ mod retry_tests {
             );
         }
         assert!(retry_delay(&ChatError::NoChoices, 1).is_none());
+    }
+    // A scripted HTTP server also asserts that no unexpected live requests,
+    // duplicate submissions, or output-file retries occur.
+    async fn server(
+        steps: Vec<(&'static str, String)>,
+    ) -> (url::Url, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (expected, body) in steps {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let len = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|s| s.parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                assert!(
+                    request.starts_with(expected),
+                    "expected {expected}, got {request}"
+                );
+                requests.push(request);
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (url, task)
+    }
+
+    fn batch_json(status: &str, output: Option<&str>, hash: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "batch-test", "object": "batch", "endpoint": "/v1/chat/completions",
+            "input_file_id": "input", "completion_window": "24h", "status": status,
+            "output_file_id": output, "created_at": 0,
+            "request_counts": {"total": 2, "completed": 1, "failed": 0},
+            "metadata": {"request_hash": hash}
+        })
+    }
+
+    fn response_json(content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "response", "object": "chat.completion", "created": 0, "model": "gpt-4o-mini",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })
+    }
+
+    fn result_line(id: String, content: &str) -> String {
+        serde_json::json!({"id": "item", "custom_id": id,
+            "response": {"status_code": 200, "request_id": "req", "body": response_json(content)}
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn wait_returns_cancelled_and_expired_batches_and_empty_results() {
+        for status in ["cancelled", "expired", "completed"] {
+            let (url, task) = server(vec![(
+                "GET /v1/batches/batch-test ",
+                batch_json(status, None, "0").to_string(),
+            )])
+            .await;
+            let mut chat = ChatClient::new("unused", "gpt-4o-mini");
+            chat.base_url = url;
+            let client = BatchClient::from(&chat);
+            let mut polls = 0;
+            let batch = client
+                .wait_for_batch("batch-test", |_| polls += 1)
+                .await
+                .unwrap();
+            assert_eq!(polls, 1);
+            assert!(batch.status.is_terminal());
+            assert!(client.get_batch_results(&batch).await.unwrap().is_empty());
+            task.await.unwrap();
+        }
+    }
+
+    #[cfg(any(feature = "small-batch-optimization", feature = "no-batch"))]
+    #[tokio::test]
+    async fn partial_batch_is_harvested_cached_and_only_remaining_request_goes_live() {
+        // Exercise terminal harvesting and cancellation of still-running work.
+        for status in ["cancelled", "expired", "in_progress", "cancelling"] {
+            let cache = tempfile::tempdir().unwrap();
+            let mut client =
+                ChatClient::new("unused", "gpt-4o-mini").with_cache_directory(cache.path());
+            #[cfg(feature = "small-batch-optimization")]
+            {
+                client = client.with_small_batch_threshold(usize::MAX);
+            }
+            let prompts = vec![
+                (vec![ChatMessage::user("alpha")], ResponseFormat::Text),
+                (vec![ChatMessage::user("beta")], ResponseFormat::Text),
+                (vec![ChatMessage::user("alpha")], ResponseFormat::Text),
+            ];
+            let requests = prompts
+                .iter()
+                .enumerate()
+                .map(|(i, (m, f))| (i, client.request_for_messages(m.clone(), f.clone())))
+                .collect::<Vec<_>>();
+            let hash = ChatClient::batch_hash(&requests);
+            let batch = batch_json(status, Some("output"), &hash);
+            let mut steps = vec![(
+                "GET /v1/batches ",
+                serde_json::json!({"object":"list", "data":[batch], "has_more":false}).to_string(),
+            )];
+            if status == "in_progress" {
+                steps.push((
+                    "POST /v1/batches/batch-test/cancel ",
+                    batch_json("cancelling", None, &hash).to_string(),
+                ));
+            }
+            if matches!(status, "in_progress" | "cancelling") {
+                steps.push((
+                    "GET /v1/batches/batch-test ",
+                    batch_json("cancelled", Some("output"), &hash).to_string(),
+                ));
+            }
+            steps.push((
+                "GET /v1/files/output/content ",
+                result_line(ChatClient::batch_custom_id(&requests[0].1), "harvested"),
+            ));
+            steps.push((
+                "POST /v1/chat/completions ",
+                response_json("live").to_string(),
+            ));
+            let (url, task) = server(steps).await;
+            client.base_url = url;
+            let results = client
+                .batch_chat_with_messages_raw(prompts.clone(), |_| {})
+                .await
+                .unwrap();
+            assert_eq!(
+                results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+                ["harvested", "live", "harvested"]
+            );
+            assert_eq!(client.batch_usage().total_tokens, 15);
+            assert_eq!(client.usage.read().unwrap().total_tokens, 15);
+            let network = task.await.unwrap();
+            let live = network.last().unwrap();
+            assert!(live.contains("beta"));
+            assert!(!live.contains("alpha"));
+            // A new client proves persistence, not just the in-memory cache.
+            let cached = ChatClient::new("unused", "gpt-4o-mini")
+                .with_cache_directory(cache.path())
+                .with_cached_only();
+            let results = cached
+                .batch_chat_with_messages_raw(prompts, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(
+                results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+                ["harvested", "live", "harvested"]
+            );
+        }
+    }
+    #[tokio::test]
+    async fn harvest_reports_item_errors_refusals_and_mapping_failures_per_item() {
+        let mut client = ChatClient::new("unused", "gpt-4o-mini");
+        let mut misses = (0..6)
+            .map(|i| {
+                (
+                    i,
+                    client.request_for_messages(
+                        vec![ChatMessage::user(i.to_string())],
+                        ResponseFormat::Text,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let requests = misses.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>();
+        let id = |i: usize| ChatClient::batch_custom_id(&requests[i]);
+        let mut refusal = response_json("unused");
+        refusal["choices"][0]["message"] = serde_json::json!({"role":"assistant", "refusal":"no"});
+        let body_item = |id: String, body: serde_json::Value| {
+            serde_json::json!({
+                "id":"item", "custom_id":id,
+                "response":{"status_code":200, "request_id":"req", "body":body}
+            })
+            .to_string()
+        };
+        let lines = [
+            result_line(id(0), "good"),
+            serde_json::json!({"id":"item", "custom_id":id(1), "error":{"code":"failed", "message":"failed"}}).to_string(),
+            body_item(id(2), serde_json::json!({"error":{"type":"invalid_request_error", "message":"bad"}})),
+            body_item(id(3), refusal),
+            result_line(id(4), "bad mapping"),
+            body_item(id(5), serde_json::json!({"malformed":"response"})),
+        ].join("\n");
+        // All IDs are present: a completed batch must not retry this file.
+        let reject_bad_mapping = |s: String| {
+            if s == "bad mapping" {
+                Err(IndividualChatError::Other(s))
+            } else {
+                Ok(s)
+            }
+        };
+        let (url, task) = server(vec![("GET /v1/files/output/content ", lines.clone())]).await;
+        client.base_url = url;
+        let batch = serde_json::from_value(batch_json("completed", Some("output"), "0")).unwrap();
+        let mut output = (0..6).map(|_| None).collect::<Vec<_>>();
+        client
+            .harvest_batch(
+                &BatchClient::from(&client),
+                &batch,
+                false,
+                &mut misses,
+                &mut output,
+                &reject_bad_mapping,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output[0].take().unwrap().unwrap(), "good");
+        // Every ID the file mentions is resolved: failures are per-item
+        // errors, not misses, and none of them is cached.
+        assert!(misses.is_empty());
+        for slot in &mut output[1..] {
+            assert!(slot.take().unwrap().is_err());
+        }
+        assert_eq!(client.batch_usage().total_tokens, 45);
+        for request in &requests[1..] {
+            assert!(client.cached_batch_content(request).await.is_none());
+        }
+        task.await.unwrap();
+
+        // The same file from a batch found on a later run: failures are
+        // retried instead, so they stay misses.
+        let (url, task) = server(vec![("GET /v1/files/output/content ", lines)]).await;
+        client.base_url = url;
+        let mut misses = requests.iter().cloned().enumerate().collect::<Vec<_>>();
+        let mut output = (0..6).map(|_| None).collect::<Vec<_>>();
+        client
+            .harvest_batch(
+                &BatchClient::from(&client),
+                &batch,
+                true,
+                &mut misses,
+                &mut output,
+                &reject_bad_mapping,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output[0].take().unwrap().unwrap(), "good");
+        assert_eq!(
+            misses.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        task.await.unwrap();
+    }
+
+    #[cfg(not(any(feature = "small-batch-optimization", feature = "no-batch")))]
+    #[tokio::test]
+    async fn replacement_batch_contains_only_missing_subset_and_its_hash() {
+        let mut client = ChatClient::new("unused", "gpt-4o-mini");
+        let prompts = ["alpha", "beta"]
+            .map(|s| (vec![ChatMessage::user(s)], ResponseFormat::Text))
+            .to_vec();
+        let requests = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, (m, f))| (i, client.request_for_messages(m.clone(), f.clone())))
+            .collect::<Vec<_>>();
+        let old = batch_json(
+            "cancelled",
+            Some("old-output"),
+            &ChatClient::batch_hash(&requests),
+        );
+        let remaining_hash = ChatClient::batch_hash(&requests[1..]);
+        let new = batch_json("completed", Some("new-output"), &remaining_hash).to_string();
+        let (url, task) = server(vec![
+            ("GET /v1/batches ", serde_json::json!({"object":"list", "data":[old], "has_more":false}).to_string()),
+            ("GET /v1/files/old-output/content ", result_line(ChatClient::batch_custom_id(&requests[0].1), "old")),
+            ("POST /v1/files ", serde_json::json!({"id":"input", "object":"file", "bytes":1, "created_at":0, "filename":"batch", "purpose":"batch"}).to_string()),
+            ("POST /v1/batches ", new.clone()),
+            ("GET /v1/batches/batch-test ", new),
+            ("GET /v1/files/new-output/content ", result_line(ChatClient::batch_custom_id(&requests[1].1), "new")),
+        ]).await;
+        client.base_url = url;
+        let values = client
+            .batch_chat_with_messages_raw(prompts, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            values.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            ["old", "new"]
+        );
+        let network = task.await.unwrap();
+        assert!(network[2].contains("beta"));
+        assert!(!network[2].contains("alpha"));
+        assert!(network[3].contains(&remaining_hash));
+        assert_eq!(client.batch_usage().total_tokens, 30);
     }
 }

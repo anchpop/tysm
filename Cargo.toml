@@ -3,7 +3,7 @@ members = ["model-prices"]
 
 [package]
 name = "tysm"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2021"
 description = "Batteries-included Rust OpenAI Client"
 license = "MIT"
@@ -26,7 +26,8 @@ default = ["dotenvy"]
 # for the queue — that dwarfs the saving on a handful of requests, and shows up
 # most on retries, where nearly everything is already cached.
 small-batch-optimization = []
-# Never use the Batch API: every `batch_*` call sends its uncached requests as
+# Never submit new batches: every `batch_*` call harvests matching existing
+# batches (cancelling in-flight work), then sends remaining uncached requests as
 # ordinary live calls (concurrently), returning the same per-item results. For
 # when the Batch API is unavailable — an org whose batches all fail validation,
 # say — and a build should finish at live prices rather than not at all.

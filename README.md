@@ -209,7 +209,24 @@ The following feature flags are available:
 
 1. `dotenvy` - (enabled by default) Enables automatic loading of environment variables from a `.env` file.
 
+2. `small-batch-optimization` - Send small sets of uncached requests live; configure the cutoff with `ChatClient::with_small_batch_threshold`.
+3. `no-batch` - Never submit new batches; send remaining uncached requests live.
+
+Both live modes first look for a matching existing batch. Completed, cancelled,
+and expired batches are harvested; in-flight batches are cancelled and polled
+until their partial results are ready. Successfully mapped responses are cached,
+and only remaining misses go live. Without these features, remaining misses are
+submitted as a new, smaller batch instead. Item errors, refusals, and invalid
+responses are not cached. Requests still unresolved after the new batch return
+`CustomIdNotFound`.
+
+At the low level, `wait_for_batch` returns completed, cancelled, or expired
+batches (and keeps polling `Cancelling`); `get_batch_results` downloads any
+available output file, or returns an empty vector for a terminal batch without
+one. Only completed batches retry missing IDs while their output file settles.
+
 Example of disabling dotenvy:
+
 ```toml
 [dependencies]
 tysm = { version = "0.2", default-features = false }

@@ -114,17 +114,9 @@ pub enum WaitForBatchError {
         /// The error message.
         error: String,
     },
-    /// The batch was cancelled.
-    #[error("Batch cancelled: {0}")]
-    BatchCancelled(String),
-
     /// Timeout waiting for batch to complete.
     #[error("Timeout waiting for batch to complete: {0}")]
     BatchTimeout(String),
-
-    /// The batch has expired.
-    #[error("Batch expired: {0}")]
-    BatchExpired(String),
 }
 
 /// Errors that can occur when getting the results of a batch.
@@ -293,6 +285,15 @@ pub enum BatchStatus {
     /// the batch was cancelled
     #[serde(rename = "cancelled")]
     Cancelled,
+}
+
+impl BatchStatus {
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::Expired | Self::Failed
+        )
+    }
 }
 
 impl std::fmt::Display for BatchStatus {
@@ -508,7 +509,8 @@ impl BatchClient {
         }
     }
 
-    /// Wait for a batch to complete, calling `on_progress` after every status poll.
+    /// Wait until a batch is completed, cancelled, or expired, calling `on_progress` after every poll.
+    /// Cancelling batches are polled until their partial results are ready.
     pub async fn wait_for_batch(
         &self,
         batch_id: &str,
@@ -576,20 +578,19 @@ impl BatchClient {
             on_progress(&batch);
 
             match batch.status {
-                BatchStatus::Completed => return Ok(batch),
+                BatchStatus::Completed | BatchStatus::Cancelled | BatchStatus::Expired => {
+                    return Ok(batch)
+                }
                 BatchStatus::Failed => {
                     return Err(WaitForBatchError::BatchFailed {
                         id: batch_id.to_string(),
                         error: batch.errors.unwrap_or_default().to_string(),
                     })
                 }
-                BatchStatus::Expired => {
-                    return Err(WaitForBatchError::BatchExpired(batch_id.to_string()))
-                }
-                BatchStatus::Cancelled | BatchStatus::Cancelling => {
-                    return Err(WaitForBatchError::BatchCancelled(batch_id.to_string()))
-                }
-                BatchStatus::InProgress | BatchStatus::Validating | BatchStatus::Finalizing => {
+                BatchStatus::Cancelling
+                | BatchStatus::InProgress
+                | BatchStatus::Validating
+                | BatchStatus::Finalizing => {
                     // Still in progress, wait and try again
                     if seconds_waited >= 86400 {
                         return Err(WaitForBatchError::BatchTimeout(batch_id.to_string()));
@@ -607,22 +608,21 @@ impl BatchClient {
         }
     }
 
-    /// Get the results of a batch.
+    /// Download available results, including partial results from cancelled or expired batches.
+    /// Terminal batches without an output file have no results.
     pub async fn get_batch_results(
         &self,
         batch: &Batch,
     ) -> Result<Vec<BatchResponseItem>, GetBatchResultsError> {
-        if batch.status != BatchStatus::Completed {
-            return Err(GetBatchResultsError::BatchNotCompleted(batch.status));
-        }
+        let Some(output_file_id) = &batch.output_file_id else {
+            return if batch.status.is_terminal() {
+                Ok(Vec::new())
+            } else {
+                Err(GetBatchResultsError::BatchNotCompleted(batch.status))
+            };
+        };
 
-        let output_file_id = batch
-            .output_file_id
-            .as_ref()
-            .ok_or_else(|| GetBatchResultsError::BatchNoOutputFile(batch.id.clone()))?;
-
-        // By the time we're downloading results the batch has already
-        // succeeded — hours of work may be sitting behind this one request,
+        // Available results may represent hours of completed work,
         // so a transient transport failure gets a few retries rather than
         // bubbling up and discarding the wait.
         let content = {
@@ -662,9 +662,7 @@ impl BatchClient {
             .http_client
             .post(
                 self.batches_url()
-                    .join(batch_id)
-                    .unwrap()
-                    .join("cancel")
+                    .join(&format!("{batch_id}/cancel"))
                     .unwrap(),
             )
             .header("Authorization", format!("Bearer {}", self.api_key))
