@@ -1,6 +1,6 @@
 [package]
 name = "model-prices"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Published per-token prices for hosted LLMs, as plain data"
 license = "MIT"

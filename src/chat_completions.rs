@@ -103,7 +103,8 @@ pub struct ChatClient {
     /// Shared HTTP client with connection pooling
     pub http_client: Client,
 
-    /// If true, all uncached requests will fail with [`ChatError::CacheMiss`] instead of
+    /// If true, all uncached requests will fail with [`ChatError::CacheMiss`] (or, in a
+    /// batch, a per-item [`IndividualChatError::CacheMiss`]) instead of
     /// hitting the API. Useful for testing or offline usage.
     pub cached_only: bool,
 
@@ -685,10 +686,6 @@ pub enum ChatError {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum BatchChatError {
-    /// One or more requests missed every configured cache while cached-only mode was enabled.
-    #[error("Cache miss: {0} batch request(s) were not found in cache")]
-    CacheMiss(usize),
-
     /// An error occurred when uploading the file to the API.
     #[error("Error uploading file")]
     FileUploadError(#[from] crate::files::FilesError),
@@ -770,6 +767,11 @@ pub enum IndividualChatError {
     /// result shape identical to the batch path's.
     #[error("The request failed: `{0}`")]
     Other(String),
+
+    /// The request was not in any configured cache and the client is in
+    /// cached-only mode (see [`ChatClient::with_cached_only`]).
+    #[error("Cache miss: request not found in cache (cached_only mode is enabled)")]
+    CacheMiss,
 }
 
 /// Live requests in flight at once when a batch is sent live instead.
@@ -887,7 +889,8 @@ impl ChatClient {
         }
     }
 
-    /// If set, all uncached requests will fail with [`ChatError::CacheMiss`] instead of
+    /// If set, all uncached requests will fail with [`ChatError::CacheMiss`] (or, in a
+    /// batch, a per-item [`IndividualChatError::CacheMiss`]) instead of
     /// hitting the API. Useful for testing or offline usage.
     pub fn with_cached_only(self) -> Self {
         Self {
@@ -1553,7 +1556,19 @@ impl ChatClient {
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
         if self.cached_only {
-            return Err(BatchChatError::CacheMiss(misses.len()));
+            // Cached-only is a per-request condition, as on the live path: the
+            // hits are still answers, and callers already handle per-item
+            // errors, so a miss is reported in its slot rather than failing
+            // the whole batch.
+            warn!(
+                "cached-only mode: {} of {} batch request(s) not found in cache",
+                misses.len(),
+                output.len()
+            );
+            for (index, _) in misses {
+                output[index] = Some(Err(IndividualChatError::CacheMiss));
+            }
+            return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
         // Send the uncached requests live instead of batching: always under
@@ -2465,4 +2480,64 @@ async fn batch_prefers_current_model_cache_over_fallback_cache() {
         .unwrap();
 
     assert_eq!(results[0].1.as_ref().unwrap().value, "current");
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn cached_only_batch_returns_hits_and_per_item_misses() {
+    #[derive(Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq)]
+    struct Answer {
+        value: String,
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let client = ChatClient::new("unused", "model").with_cache_directory(temp.path());
+    let request = client.request_for_messages(
+        vec![
+            ChatMessage::system("return a value"),
+            ChatMessage::user("alpha"),
+        ],
+        ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaFormat::new::<Answer>(),
+        },
+    );
+    client
+        .cache_batch_response(
+            &request,
+            &ChatResponse {
+                id: "cached".into(),
+                object: "chat.completion".into(),
+                created: 0,
+                model: client.model.clone(),
+                system_fingerprint: None,
+                choices: vec![ChatChoice {
+                    index: 0,
+                    message: ChatMessageResponse {
+                        role: Role::Assistant,
+                        content: Some(r#"{"value":"cached"}"#.into()),
+                        refusal: None,
+                    },
+                    logprobs: None,
+                    finish_reason: "stop".into(),
+                }],
+                usage: ChatUsage::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let client = client.with_cached_only();
+    let items = vec!["alpha".to_string(), "beta".to_string()];
+    let results = client
+        .batch_chat_with_system_prompt_fn::<_, _, Answer>(
+            "return a value",
+            &items,
+            Clone::clone,
+            |_| {},
+        )
+        .await
+        .expect("a cached-only batch reports misses per item, not as a batch failure");
+
+    assert_eq!(results[0].1.as_ref().unwrap().value, "cached");
+    assert!(matches!(results[1].1, Err(IndividualChatError::CacheMiss)));
 }

@@ -346,6 +346,26 @@ pub const MODELS: &[ModelCost] = &[
                 .flex(10.00, Some(1.00), 37.50)
                 .priority(40.00, Some(4.00), 150.00),
         ),
+    // GPT-6 Sol and Luna (2026-09-22): half the GPT-5.6 Sol/Luna standard
+    // prices; flex is half of standard and priority twice it, and long
+    // context follows the gpt-6-astra convention above (extrapolated, not
+    // vendor-confirmed). https://openai.com/pricing
+    model("gpt-6-sol", 2.00, Some(0.20), 10.00)
+        .flex(1.00, Some(0.10), 5.00)
+        .priority(4.00, Some(0.40), 20.00)
+        .long_context(
+            long(272_000, 4.00, Some(0.40), 15.00)
+                .flex(2.00, Some(0.20), 7.50)
+                .priority(8.00, Some(0.80), 30.00),
+        ),
+    model("gpt-6-luna", 0.10, Some(0.01), 0.50)
+        .flex(0.05, Some(0.005), 0.25)
+        .priority(0.20, Some(0.02), 1.00)
+        .long_context(
+            long(272_000, 0.20, Some(0.02), 0.75)
+                .flex(0.10, Some(0.01), 0.375)
+                .priority(0.40, Some(0.04), 1.50),
+        ),
     // GPT-5 models
     //
     // Only the 5.6 family carries a `long_context` card here, because those
@@ -433,7 +453,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-09-21";
+pub const RATE_CARD_VERSION: &str = "2026-09-22";
 
 /// The cost in dollars of a **single** request.
 ///

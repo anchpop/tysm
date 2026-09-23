@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "model-prices"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "native-tls"
@@ -1498,7 +1498,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "tysm"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
