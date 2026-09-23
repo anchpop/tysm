@@ -93,8 +93,8 @@ pub struct ChatClient {
     /// most responses are cached, what remains is a handful of stragglers that
     /// would otherwise wait on a whole batch round trip.
     ///
-    /// Only consulted when the `small-batch-optimization` feature is enabled.
-    #[cfg(feature = "small-batch-optimization")]
+    /// Zero (the default) always batches; `usize::MAX` never submits a new
+    /// batch (see [`ChatClient::with_no_batch`]).
     pub small_batch_threshold: usize,
 
     /// Semaphore to limit the maximum number of concurrent requests
@@ -800,7 +800,7 @@ pub enum IndividualChatError {
     /// The request failed outright.
     ///
     /// Only produced when a batch's requests are sent live (see the
-    /// `small-batch-optimization` feature): a transport or API failure belongs
+    /// small-batch threshold or `with_no_batch`): a transport or API failure belongs
     /// to that one request, and reporting it per-item keeps the live path's
     /// result shape identical to the batch path's.
     #[error("The request failed: `{0}`")]
@@ -843,8 +843,7 @@ impl ChatClient {
             prompt_cache_key: None,
             reasoning_effort: None,
             extra_body: None,
-            #[cfg(feature = "small-batch-optimization")]
-            small_batch_threshold: 16,
+            small_batch_threshold: 0,
             semaphore: Semaphore::new(100),
             http_client: crate::utils::pooled_client(),
             cached_only: false,
@@ -853,11 +852,21 @@ impl ChatClient {
     }
 
     /// How few uncached requests a batch may contain before it is sent as
-    /// ordinary live calls instead. Defaults to 16; zero disables the shortcut.
-    #[cfg(feature = "small-batch-optimization")]
+    /// ordinary live calls instead. Zero (the default) always batches.
     pub fn with_small_batch_threshold(mut self, threshold: usize) -> Self {
         self.small_batch_threshold = threshold;
         self
+    }
+
+    /// Never submit a new batch: every `batch_*` call still harvests a
+    /// matching existing batch (cancelling it if it is in flight), then sends
+    /// the remaining uncached requests as ordinary live calls, concurrently,
+    /// returning the same per-item results. For when the Batch API is
+    /// unavailable — an org whose batches all fail validation, say — or a
+    /// backlog of nearly finished batches should be cashed in now, and a run
+    /// should finish at live prices rather than not at all.
+    pub fn with_no_batch(self) -> Self {
+        self.with_small_batch_threshold(usize::MAX)
     }
 
     /// Set the cache directory for the client.
@@ -1626,17 +1635,11 @@ impl ChatClient {
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
-        // Send the uncached requests live instead of batching: always under
-        // `no-batch`, or under `small-batch-optimization` when there are too
-        // few to be worth a batch's fixed overhead. Decided on `misses`, not
-        // the caller's total, so a retry whose responses are nearly all cached
-        // skips the queue entirely.
-        #[cfg(feature = "no-batch")]
-        let send_live = true;
-        #[cfg(all(feature = "small-batch-optimization", not(feature = "no-batch")))]
+        // Send the uncached requests live instead of batching when there are
+        // too few to be worth a batch's fixed overhead (or always, under
+        // `with_no_batch`). Decided on `misses`, not the caller's total, so a
+        // retry whose responses are nearly all cached skips the queue entirely.
         let send_live = misses.len() <= self.small_batch_threshold;
-        #[cfg(not(any(feature = "no-batch", feature = "small-batch-optimization")))]
-        let send_live = false;
         let batch_client = BatchClient::from(self);
         let existing = match self.find_batch_by_hash(&batch_client, &misses).await {
             Ok(existing) => existing,
@@ -1652,7 +1655,7 @@ impl ChatClient {
             if !batch.status.is_terminal() {
                 if send_live && batch.status != BatchStatus::Cancelling {
                     warn!(
-                        "no-batch mode: cancelling in-flight batch {} for these requests \
+                        "sending live: cancelling in-flight batch {} for these requests \
                          and harvesting its completed results",
                         batch.id
                     );
@@ -2771,18 +2774,14 @@ mod retry_tests {
         }
     }
 
-    #[cfg(any(feature = "small-batch-optimization", feature = "no-batch"))]
     #[tokio::test]
     async fn partial_batch_is_harvested_cached_and_only_remaining_request_goes_live() {
         // Exercise terminal harvesting and cancellation of still-running work.
         for status in ["cancelled", "expired", "in_progress", "cancelling"] {
             let cache = tempfile::tempdir().unwrap();
-            let mut client =
-                ChatClient::new("unused", "gpt-4o-mini").with_cache_directory(cache.path());
-            #[cfg(feature = "small-batch-optimization")]
-            {
-                client = client.with_small_batch_threshold(usize::MAX);
-            }
+            let mut client = ChatClient::new("unused", "gpt-4o-mini")
+                .with_cache_directory(cache.path())
+                .with_no_batch();
             let prompts = vec![
                 (vec![ChatMessage::user("alpha")], ResponseFormat::Text),
                 (vec![ChatMessage::user("beta")], ResponseFormat::Text),
@@ -2943,7 +2942,6 @@ mod retry_tests {
         task.await.unwrap();
     }
 
-    #[cfg(not(any(feature = "small-batch-optimization", feature = "no-batch")))]
     #[tokio::test]
     async fn replacement_batch_contains_only_missing_subset_and_its_hash() {
         let mut client = ChatClient::new("unused", "gpt-4o-mini");
@@ -2986,14 +2984,9 @@ mod retry_tests {
         assert_eq!(client.batch_usage().total_tokens, 30);
     }
 
-    #[cfg(any(feature = "small-batch-optimization", feature = "no-batch"))]
     #[tokio::test]
     async fn unreadable_output_file_of_an_old_batch_is_a_miss_not_an_error() {
-        let mut client = ChatClient::new("unused", "gpt-4o-mini");
-        #[cfg(feature = "small-batch-optimization")]
-        {
-            client = client.with_small_batch_threshold(usize::MAX);
-        }
+        let mut client = ChatClient::new("unused", "gpt-4o-mini").with_no_batch();
         let prompts = vec![(vec![ChatMessage::user("alpha")], ResponseFormat::Text)];
         let requests = vec![(
             0,
