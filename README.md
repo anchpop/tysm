@@ -209,16 +209,14 @@ The following feature flags are available:
 
 1. `dotenvy` - (enabled by default) Enables automatic loading of environment variables from a `.env` file.
 
-2. `small-batch-optimization` - Send small sets of uncached requests live; configure the cutoff with `ChatClient::with_small_batch_threshold`.
-3. `no-batch` - Never submit new batches; send remaining uncached requests live.
-
-Both live modes first look for a matching existing batch. Completed, cancelled,
-and expired batches are harvested; in-flight batches are cancelled and polled
-until their partial results are ready. Successfully mapped responses are cached,
-and only remaining misses go live. Without these features, remaining misses are
-submitted as a new, smaller batch instead. Item errors, refusals, and invalid
-responses are not cached. Requests still unresolved after the new batch return
-`CustomIdNotFound`.
+Batching is configured at runtime rather than by feature: `ChatClient::with_small_batch_threshold`
+sends a batch's uncached requests live when there are few enough of them, and
+`with_no_batch` never submits a new batch at all. Either way a `batch_*` call first
+looks for a matching existing batch. Completed, cancelled, and expired batches are
+harvested; under `with_no_batch` an in-flight one is cancelled and polled until its
+partial results are ready. Successfully mapped responses are cached, and only the
+remaining misses go live (or, when batching, into a new, smaller batch). Item errors,
+refusals, and invalid responses are not cached.
 
 At the low level, `wait_for_batch` returns completed, cancelled, or expired
 batches (and keeps polling `Cancelling`); `get_batch_results` downloads any
