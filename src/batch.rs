@@ -326,12 +326,14 @@ pub struct BatchList {
 
 impl BatchRequestItem {
     /// Create a new batch request item for the chat completions API.
-    pub fn new_chat(custom_id: impl Into<String>, chat_request: ChatRequest) -> Self {
-        let body = serde_json::json!({
-            "model": chat_request.model,
-            "messages": chat_request.messages,
-            "response_format": chat_request.response_format,
-        });
+    ///
+    /// The body is the same serialized [`ChatRequest`] a live call sends, so
+    /// every option (reasoning effort, prompt-cache key, extra body fields)
+    /// reaches the Batch API too. Only the service tier is dropped: a batch
+    /// runs on its own tier.
+    pub fn new_chat(custom_id: impl Into<String>, mut chat_request: ChatRequest) -> Self {
+        chat_request.service_tier = None;
+        let body = serde_json::to_value(&chat_request).expect("ChatRequest serializes");
         Self {
             custom_id: custom_id.into(),
             method: "POST".to_string(),
@@ -792,4 +794,28 @@ fn test_batch_request_serialization() {
     assert!(serialized.contains("gpt-4o"));
     assert!(serialized.contains("helpful assistant"));
     assert!(serialized.contains("Hello world!"));
+}
+
+#[test]
+fn batch_body_carries_every_live_request_option() {
+    use crate::chat_completions::{ChatMessage, ResponseFormat};
+    let request = ChatRequest {
+        model: "gpt-6-luna".into(),
+        messages: vec![ChatMessage::user("Hello world!")],
+        response_format: ResponseFormat::Text,
+        service_tier: Some("flex".into()),
+        prompt_cache_key: Some("proofread-fra".into()),
+        reasoning_effort: Some("low".into()),
+        extra_body: Some(serde_json::json!({"verbosity": "low"})),
+    };
+    let body = BatchRequestItem::new_chat("request-1", request).body;
+    assert_eq!(body["model"], "gpt-6-luna");
+    assert_eq!(body["reasoning_effort"], "low");
+    assert_eq!(body["prompt_cache_key"], "proofread-fra");
+    assert_eq!(body["verbosity"], "low");
+    assert_eq!(body["messages"][0]["content"][0]["text"], "Hello world!");
+    assert!(
+        body.get("service_tier").is_none(),
+        "a batch runs on its own tier"
+    );
 }
