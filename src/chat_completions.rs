@@ -633,7 +633,7 @@ const LIVE_REQUEST_ATTEMPTS: u32 = 4;
 /// The flex service tier answers `flex_unavailable` whenever OpenAI has no
 /// spare capacity; rate limits and server faults are the same shape of
 /// problem. In each case the request is fine and only the moment is wrong.
-fn is_transient_api_error(error: &OpenAiError) -> bool {
+pub(crate) fn is_transient_api_error(error: &OpenAiError) -> bool {
     let code = error.code.as_deref().unwrap_or_default();
     matches!(
         code,
@@ -2775,6 +2775,31 @@ mod retry_tests {
     }
 
     #[tokio::test]
+    async fn wait_rides_out_a_rate_limited_status_poll() {
+        let rate_limited = serde_json::json!({"error": {
+            "message": "You've exceeded the 100 request(s) every 1 minute(s) rate limit",
+            "type": "invalid_request_error", "param": null, "code": "rate_limit_exceeded"
+        }})
+        .to_string();
+        let (url, task) = server(vec![
+            ("GET /v1/batches/batch-test ", rate_limited),
+            (
+                "GET /v1/batches/batch-test ",
+                batch_json("completed", None, "0").to_string(),
+            ),
+        ])
+        .await;
+        let mut chat = ChatClient::new("unused", "gpt-4o-mini");
+        chat.base_url = url;
+        let batch = BatchClient::from(&chat)
+            .wait_for_batch("batch-test", |_| {})
+            .await
+            .unwrap();
+        assert!(batch.status.is_terminal());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn partial_batch_is_harvested_cached_and_only_remaining_request_goes_live() {
         // Exercise terminal harvesting and cancellation of still-running work.
         for status in ["cancelled", "expired", "in_progress", "cancelling"] {
@@ -2795,7 +2820,7 @@ mod retry_tests {
             let hash = ChatClient::batch_hash(&requests);
             let batch = batch_json(status, Some("output"), &hash);
             let mut steps = vec![(
-                "GET /v1/batches ",
+                "GET /v1/batches?limit=100 ",
                 serde_json::json!({"object":"list", "data":[batch], "has_more":false}).to_string(),
             )];
             if status == "in_progress" {
@@ -2961,7 +2986,7 @@ mod retry_tests {
         let remaining_hash = ChatClient::batch_hash(&requests[1..]);
         let new = batch_json("completed", Some("new-output"), &remaining_hash).to_string();
         let (url, task) = server(vec![
-            ("GET /v1/batches ", serde_json::json!({"object":"list", "data":[old], "has_more":false}).to_string()),
+            ("GET /v1/batches?limit=100 ", serde_json::json!({"object":"list", "data":[old], "has_more":false}).to_string()),
             ("GET /v1/files/old-output/content ", result_line(ChatClient::batch_custom_id(&requests[0].1), "old")),
             ("POST /v1/files ", serde_json::json!({"id":"input", "object":"file", "bytes":1, "created_at":0, "filename":"batch", "purpose":"batch"}).to_string()),
             ("POST /v1/batches ", new.clone()),
@@ -2999,7 +3024,7 @@ mod retry_tests {
         );
         let (url, task) = server(vec![
             (
-                "GET /v1/batches ",
+                "GET /v1/batches?limit=100 ",
                 serde_json::json!({"object":"list", "data":[batch], "has_more":false}).to_string(),
             ),
             (

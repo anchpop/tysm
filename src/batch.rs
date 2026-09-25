@@ -171,6 +171,20 @@ pub enum ListBatchesError {
     OpenAiError(#[from] OpenAiError),
 }
 
+/// An error body from the API. OpenAI wraps it as `{"error": {...}}`; a bare
+/// error object is accepted too. Reading only the bare shape turned every API
+/// error on the batch endpoints (rate limits included) into a JSON parse
+/// error that no caller could recognize or retry.
+fn parse_api_error(text: &str) -> Result<OpenAiError, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Wrapped {
+        error: OpenAiError,
+    }
+    serde_json::from_str::<Wrapped>(text)
+        .map(|wrapped| wrapped.error)
+        .or_else(|_| serde_json::from_str(text))
+}
+
 /// A request item for a batch.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BatchRequestItem {
@@ -475,7 +489,7 @@ impl BatchClient {
             }
             Err(e) => {
                 // Try to parse as an OpenAI error
-                let error: Result<OpenAiError, _> = serde_json::from_str(&response_text);
+                let error = parse_api_error(&response_text);
                 match error {
                     Ok(error) => Err(CreateBatchError::OpenAiError(error)),
                     Err(_) => Err(CreateBatchError::JsonParseError(e, response_text)),
@@ -502,7 +516,7 @@ impl BatchClient {
             Ok(batch) => Ok(batch),
             Err(e) => {
                 // Try to parse as an OpenAI error
-                let error: Result<OpenAiError, _> = serde_json::from_str(&response_text);
+                let error = parse_api_error(&response_text);
                 match error {
                     Ok(error) => Err(GetBatchStatusError::OpenAiError(error)),
                     Err(_) => Err(GetBatchStatusError::JsonParseError(e, response_text)),
@@ -527,10 +541,15 @@ impl BatchClient {
                     failed_polls = 0;
                     batch
                 }
-                Err(
-                    e @ (GetBatchStatusError::RequestError(_)
-                    | GetBatchStatusError::JsonParseError(..)),
-                ) => {
+                Err(e)
+                    if match &e {
+                        GetBatchStatusError::RequestError(_)
+                        | GetBatchStatusError::JsonParseError(..) => true,
+                        GetBatchStatusError::OpenAiError(error) => {
+                            crate::chat_completions::is_transient_api_error(error)
+                        }
+                    } =>
+                {
                     // A batch can run for hours, and every status poll opens a
                     // fresh connection — so sooner or later one poll hits a
                     // dropped connection, a DNS blip, or a laptop switching
@@ -540,8 +559,9 @@ impl BatchClient {
                     // than a transport one; it means the same thing. Neither
                     // must abort a wait that is already hours deep: the batch
                     // itself is fine on OpenAI's side. Treat both as "still
-                    // waiting" and poll again; errors the API itself reports
-                    // (OpenAiError) still propagate immediately.
+                    // waiting" and poll again, as well as API errors that only
+                    // mean "not now" (rate limits, overload, server faults);
+                    // any other error the API reports propagates immediately.
                     //
                     // Only *consecutive* failures count toward giving up, so
                     // isolated blips are free however long the wait runs, but
@@ -679,7 +699,7 @@ impl BatchClient {
             Ok(batch) => Ok(batch),
             Err(e) => {
                 // Try to parse as an OpenAI error
-                let error: Result<OpenAiError, _> = serde_json::from_str(&response_text);
+                let error = parse_api_error(&response_text);
                 match error {
                     Ok(error) => Err(CancelBatchError::OpenAiError(error)),
                     Err(_) => Err(CancelBatchError::JsonParseError(e, response_text)),
@@ -697,9 +717,7 @@ impl BatchClient {
         let mut last_batch_id = None;
 
         loop {
-            let batch_list = self
-                .list_batches_limited(None, last_batch_id.as_deref())
-                .await?;
+            let batch_list = self.list_batch_page(last_batch_id.as_deref()).await?;
 
             if batch_list.data.is_empty() {
                 break;
@@ -719,6 +737,33 @@ impl BatchClient {
         }
 
         Ok(all_batches)
+    }
+
+    /// One page of the batch list, as large as the API allows, retried while
+    /// the API says to slow down.
+    ///
+    /// Listing walks an organization's whole batch history, and many batch
+    /// calls starting at once each walk it to look for a reusable batch. At
+    /// the default 20 per page that exceeds the list endpoint's 100 requests a
+    /// minute; a rate limit is only the wrong moment, so it is waited out.
+    async fn list_batch_page(&self, after: Option<&str>) -> Result<BatchList, ListBatchesError> {
+        const PAGE: u32 = 100;
+        const ATTEMPTS: u32 = 10;
+        let mut attempt = 1;
+        loop {
+            match self.list_batches_limited(Some(PAGE), after).await {
+                Err(ListBatchesError::OpenAiError(error))
+                    if attempt < ATTEMPTS
+                        && crate::chat_completions::is_transient_api_error(&error) =>
+                {
+                    let wait = Duration::from_secs(15 * u64::from(attempt));
+                    warn!("listing batches: {error}; retrying in {wait:?}");
+                    sleep(wait).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// List all batches.
@@ -756,7 +801,7 @@ impl BatchClient {
             Ok(batch_list) => Ok(batch_list),
             Err(e) => {
                 // Try to parse as an OpenAI error
-                let error: Result<OpenAiError, _> = serde_json::from_str(&response_text);
+                let error = parse_api_error(&response_text);
                 match error {
                     Ok(error) => Err(ListBatchesError::OpenAiError(error)),
                     Err(_) => Err(ListBatchesError::JsonParseError(e, response_text)),
@@ -818,4 +863,21 @@ fn batch_body_carries_every_live_request_option() {
         body.get("service_tier").is_none(),
         "a batch runs on its own tier"
     );
+}
+
+#[test]
+fn api_errors_parse_in_the_wrapped_shape_the_api_sends() {
+    let body = r#"{
+      "error": {
+        "message": "You've exceeded the 100 request(s) every 1 minute(s) rate limit, please slow down and try again.",
+        "type": "invalid_request_error",
+        "param": null,
+        "code": "rate_limit_exceeded"
+      }
+    }"#;
+    let error = parse_api_error(body).unwrap();
+    assert_eq!(error.code.as_deref(), Some("rate_limit_exceeded"));
+    assert!(crate::chat_completions::is_transient_api_error(&error));
+    let bare = r#"{"type": "server_error", "message": "oops", "code": null, "param": null}"#;
+    assert_eq!(parse_api_error(bare).unwrap().r#type, "server_error");
 }
