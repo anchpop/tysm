@@ -2968,6 +2968,55 @@ mod retry_tests {
     }
 
     #[tokio::test]
+    async fn items_the_api_failed_to_run_are_read_from_the_error_file() {
+        let mut client = ChatClient::new("unused", "gpt-4o-mini");
+        let mut misses = (0..2)
+            .map(|i| {
+                (
+                    i,
+                    client.request_for_messages(
+                        vec![ChatMessage::user(i.to_string())],
+                        ResponseFormat::Text,
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let id = |i: usize| ChatClient::batch_custom_id(&misses[i].1);
+        // As OpenAI wrote it for one request of a 30,899-request batch.
+        let failed = serde_json::json!({"id":"item", "custom_id":id(1), "error":null,
+            "response":{"status_code":500, "request_id":"",
+                "body":{"error":{"message":"BatchAPI failed to execute task in batch"}}}
+        })
+        .to_string();
+        // One download per file: the item is not missing, so no re-fetch.
+        let (url, task) = server(vec![
+            ("GET /v1/files/output/content ", result_line(id(0), "good")),
+            ("GET /v1/files/errors/content ", failed),
+        ])
+        .await;
+        client.base_url = url;
+        let mut batch = batch_json("completed", Some("output"), "0");
+        batch["error_file_id"] = "errors".into();
+        let batch = serde_json::from_value(batch).unwrap();
+        let mut output = (0..2).map(|_| None).collect::<Vec<_>>();
+        client
+            .harvest_batch(
+                &BatchClient::from(&client),
+                &batch,
+                false,
+                &mut misses,
+                &mut output,
+                &|s: String| Ok::<_, IndividualChatError>(s),
+            )
+            .await
+            .unwrap();
+        assert!(misses.is_empty());
+        assert_eq!(output[0].take().unwrap().unwrap(), "good");
+        assert!(output[1].take().unwrap().is_err());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn replacement_batch_contains_only_missing_subset_and_its_hash() {
         let mut client = ChatClient::new("unused", "gpt-4o-mini");
         let prompts = ["alpha", "beta"]

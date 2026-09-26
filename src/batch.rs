@@ -631,51 +631,60 @@ impl BatchClient {
     }
 
     /// Download available results, including partial results from cancelled or expired batches.
-    /// Terminal batches without an output file have no results.
+    /// Items the API failed to run (say, a 500 on one request) are not in the
+    /// output file but in the error file, so both are read: an item missing
+    /// from the output file is not necessarily missing from the batch.
+    /// Terminal batches without either file have no results.
     pub async fn get_batch_results(
         &self,
         batch: &Batch,
     ) -> Result<Vec<BatchResponseItem>, GetBatchResultsError> {
-        let Some(output_file_id) = &batch.output_file_id else {
-            return if batch.status.is_terminal() {
-                Ok(Vec::new())
-            } else {
-                Err(GetBatchResultsError::BatchNotCompleted(batch.status))
-            };
-        };
-
-        // Available results may represent hours of completed work,
-        // so a transient transport failure gets a few retries rather than
-        // bubbling up and discarding the wait.
-        let content = {
-            let mut attempt = 0;
-            loop {
-                match self.files_client.download_file(output_file_id).await {
-                    Ok(content) => break content,
-                    Err(FilesError::RequestError(e)) if attempt < 5 => {
-                        attempt += 1;
-                        let delay = 10 * attempt;
-                        warn!(
-                            "transient error downloading results for batch {}, \
-                             retrying in {delay} seconds: {e}",
-                            batch.id
-                        );
-                        sleep(Duration::from_secs(delay)).await;
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        };
-        debug!("Got results for batch {}: {}", batch.id, content);
+        if batch.output_file_id.is_none() && !batch.status.is_terminal() {
+            return Err(GetBatchResultsError::BatchNotCompleted(batch.status));
+        }
 
         let mut results = Vec::new();
-        for line in content.lines() {
-            let result: BatchResponseItem = serde_json::from_str(line)
-                .map_err(|e| GetBatchResultsError::JsonParseError(e, content.clone()))?;
-            results.push(result);
+        for file_id in [&batch.output_file_id, &batch.error_file_id]
+            .into_iter()
+            .flatten()
+        {
+            let content = self.download_batch_file(batch, file_id).await?;
+            debug!("Got results for batch {}: {}", batch.id, content);
+            for line in content.lines() {
+                let result: BatchResponseItem = serde_json::from_str(line)
+                    .map_err(|e| GetBatchResultsError::JsonParseError(e, content.clone()))?;
+                results.push(result);
+            }
         }
 
         Ok(results)
+    }
+
+    /// Available results may represent hours of completed work, so a
+    /// transient transport failure gets a few retries rather than bubbling up
+    /// and discarding the wait.
+    async fn download_batch_file(
+        &self,
+        batch: &Batch,
+        file_id: &str,
+    ) -> Result<String, GetBatchResultsError> {
+        let mut attempt = 0;
+        loop {
+            match self.files_client.download_file(file_id).await {
+                Ok(content) => return Ok(content),
+                Err(FilesError::RequestError(e)) if attempt < 5 => {
+                    attempt += 1;
+                    let delay = 10 * attempt;
+                    warn!(
+                        "transient error downloading results for batch {}, \
+                         retrying in {delay} seconds: {e}",
+                        batch.id
+                    );
+                    sleep(Duration::from_secs(delay)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Cancel a batch.
