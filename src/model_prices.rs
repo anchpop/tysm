@@ -14,13 +14,13 @@ use crate::chat_completions::ChatUsage;
 /// The billable token counts of one request.
 ///
 /// `completion_tokens` already includes any reasoning tokens, so
-/// `completion_token_details` is deliberately not added on top of it — that
+/// `completion_tokens_details` is deliberately not added on top of it — that
 /// would charge reasoning twice.
 fn tokens_of(usage: ChatUsage) -> CallTokens {
     CallTokens {
         prompt: usage.prompt_tokens,
         cached_prompt: usage
-            .prompt_token_details
+            .prompt_tokens_details
             .map_or(0, |details| details.cached_tokens),
         output: usage.completion_tokens,
     }
@@ -51,22 +51,25 @@ pub fn cost_of_call_split(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_completions::PromptTokenDetails;
 
     /// The table is tested in the `model-prices` crate; what needs covering
     /// here is the translation, and above all that cached tokens reach it —
-    /// dropping them would quietly bill every cache hit at full price.
+    /// dropping them would quietly bill every cache hit at full price. Parsed
+    /// from the API's own JSON shape, since a misspelled field name once
+    /// deserialized as `None` and silently did exactly that.
     #[test]
     fn chat_usage_translates_to_billable_tokens() {
-        let usage = ChatUsage {
-            prompt_tokens: 2_000_000,
-            completion_tokens: 1_000_000,
-            total_tokens: 3_000_000,
-            prompt_token_details: Some(PromptTokenDetails {
-                cached_tokens: 1_000_000,
-            }),
-            completion_token_details: None,
-        };
+        let usage: ChatUsage = serde_json::from_str(
+            r#"{"prompt_tokens":2000000,"completion_tokens":1000000,"total_tokens":3000000,
+                "prompt_tokens_details":{"cached_tokens":1000000,"cache_write_tokens":0,"audio_tokens":0},
+                "completion_tokens_details":{"reasoning_tokens":21,"audio_tokens":0,
+                    "accepted_prediction_tokens":0,"rejected_prediction_tokens":0}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage.completion_tokens_details.unwrap().reasoning_tokens,
+            21
+        );
         assert_eq!(
             tokens_of(usage),
             CallTokens {
@@ -89,8 +92,8 @@ mod tests {
             prompt_tokens: 1_000_000,
             completion_tokens: 0,
             total_tokens: 1_000_000,
-            prompt_token_details: None,
-            completion_token_details: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
         };
         assert_eq!(tokens_of(usage).cached_prompt, 0);
         assert_eq!(cost_of_call("gpt-4o", None, usage), Some(2.50));

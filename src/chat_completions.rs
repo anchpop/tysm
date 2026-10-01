@@ -570,15 +570,17 @@ pub struct ChatUsage {
 
     /// Details about the prompt tokens (such as whether they were cached).
     #[serde(default)]
-    pub prompt_token_details: Option<PromptTokenDetails>,
+    pub prompt_tokens_details: Option<PromptTokenDetails>,
     /// Details about the completion tokens for reasoning models
     #[serde(default)]
-    pub completion_token_details: Option<CompletionTokenDetails>,
+    pub completion_tokens_details: Option<CompletionTokenDetails>,
 }
 
 /// Includes details about the prompt tokens.
 /// Currently, only contains the number of cached tokens.
+// Defaulted field by field: some OpenAI-compatible providers send only a subset.
 #[derive(Deserialize, Debug, Default, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct PromptTokenDetails {
     /// OpenAI automatically caches tokens that are used in a previous request.
     /// This reduces input cost.
@@ -587,6 +589,7 @@ pub struct PromptTokenDetails {
 
 /// Includes details about the completion tokens for reasoning models
 #[derive(Deserialize, Debug, Default, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct CompletionTokenDetails {
     /// The number of tokens used for reasoning.
     pub reasoning_tokens: u32,
@@ -603,19 +606,21 @@ impl std::ops::AddAssign for ChatUsage {
         self.completion_tokens += rhs.completion_tokens;
         self.total_tokens += rhs.total_tokens;
 
-        self.prompt_token_details = match (self.prompt_token_details, rhs.prompt_token_details) {
+        self.prompt_tokens_details = match (self.prompt_tokens_details, rhs.prompt_tokens_details) {
             (Some(lhs), Some(rhs)) => Some(lhs + rhs),
             (None, Some(rhs)) => Some(rhs),
             (Some(lhs), None) => Some(lhs),
             (None, None) => None,
         };
-        self.completion_token_details =
-            match (self.completion_token_details, rhs.completion_token_details) {
-                (Some(lhs), Some(rhs)) => Some(lhs + rhs),
-                (None, Some(rhs)) => Some(rhs),
-                (Some(lhs), None) => Some(lhs),
-                (None, None) => None,
-            };
+        self.completion_tokens_details = match (
+            self.completion_tokens_details,
+            rhs.completion_tokens_details,
+        ) {
+            (Some(lhs), Some(rhs)) => Some(lhs + rhs),
+            (None, Some(rhs)) => Some(rhs),
+            (Some(lhs), None) => Some(lhs),
+            (None, None) => None,
+        };
     }
 }
 
@@ -2144,8 +2149,8 @@ fn cost_includes_batch_usage_at_half_price() {
         prompt_tokens: 1_000_000,
         completion_tokens: 1_000_000,
         total_tokens: 2_000_000,
-        prompt_token_details: None,
-        completion_token_details: None,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     };
 
     client.record_spend(None, usage, 1.0);
@@ -2165,8 +2170,8 @@ fn an_unpriced_request_makes_the_total_unknowable() {
         prompt_tokens: 1_000,
         completion_tokens: 1_000,
         total_tokens: 2_000,
-        prompt_token_details: None,
-        completion_token_details: None,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     };
 
     // A client that has done nothing has spent nothing, whatever its model.
@@ -2185,8 +2190,8 @@ fn spend_accumulates_per_request_not_from_summed_tokens() {
         prompt_tokens: 50_000,
         completion_tokens: 0,
         total_tokens: 50_000,
-        prompt_token_details: None,
-        completion_token_details: None,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     };
 
     // Six 50k requests sum to 300k tokens, past luna's 272k threshold — but
