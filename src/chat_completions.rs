@@ -196,6 +196,7 @@ pub enum ChatMessageContent {
     /// let content = ChatMessageContent::ImageUrl {
     ///     image: ImageUrl {
     ///         url: format!("data:image/png;base64,{base64_image}"),
+    ///         detail: None,
     ///     },
     /// };
     /// ```
@@ -224,6 +225,22 @@ pub enum ChatMessageContent {
 pub struct ImageUrl {
     /// The image URL.
     pub url: String,
+    /// How closely the model looks at the image. `None` leaves it to OpenAI (`auto`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ImageDetail>,
+}
+
+/// The resolution the model sees an image at. `Low` is a fixed, small token
+/// cost per image; `High` tiles it at full resolution.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    /// A 512×512 preview at a fixed token cost.
+    Low,
+    /// Full resolution, tiled.
+    High,
+    /// Let OpenAI choose based on the image size.
+    Auto,
 }
 
 /// Base64-encoded audio input.
