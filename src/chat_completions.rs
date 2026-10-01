@@ -46,7 +46,8 @@ pub struct ChatClient {
     pub chat_completions_path: String,
     /// The model to use for the ChatGPT API.
     pub model: String,
-    /// A cache of recent responses.
+    /// A cache of recent responses, keyed by the request's cache key rather than
+    /// the request itself, so base64 images and audio aren't held in memory.
     pub lru: DashMap<String, String>,
     /// This client's token consumption (as reported by the API). Batch API requests are tracked separately in `batch_usage`.
     pub usage: RwLock<ChatUsage>,
@@ -196,6 +197,7 @@ pub enum ChatMessageContent {
     /// let content = ChatMessageContent::ImageUrl {
     ///     image: ImageUrl {
     ///         url: format!("data:image/png;base64,{base64_image}"),
+    ///         detail: None,
     ///     },
     /// };
     /// ```
@@ -224,6 +226,22 @@ pub enum ChatMessageContent {
 pub struct ImageUrl {
     /// The image URL.
     pub url: String,
+    /// How closely the model looks at the image. `None` leaves it to OpenAI (`auto`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ImageDetail>,
+}
+
+/// The resolution the model sees an image at. `Low` is a fixed, small token
+/// cost per image; `High` tiles it at full resolution.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    /// A 512×512 preview at a fixed token cost.
+    Low,
+    /// Full resolution, tiled.
+    High,
+    /// Let OpenAI choose based on the image size.
+    Auto,
 }
 
 /// Base64-encoded audio input.
@@ -1321,8 +1339,6 @@ impl ChatClient {
         // cache the response
         {
             let chat_request_cache_key = chat_request.cache_key();
-            let chat_request = serde_json::to_string(&chat_request)
-                .map_err(|e| ChatError::JsonSerializeError(e, chat_request.clone()))?;
 
             if let Some(cache_directory) = &self.cache_directory {
                 // Compress the response with zstd before writing to disk
@@ -1335,7 +1351,7 @@ impl ChatClient {
                 .await?;
             }
 
-            self.lru.insert(chat_request, chat_response);
+            self.lru.insert(chat_request_cache_key, chat_response);
         }
 
         Ok(result)
@@ -1544,10 +1560,7 @@ impl ChatClient {
             crate::cache::write_to_cache_dir(cache_directory, &request.cache_key(), &compressed)
                 .await?;
         }
-        self.lru.insert(
-            serde_json::to_string(request).expect("ChatRequest is serializable"),
-            raw,
-        );
+        self.lru.insert(request.cache_key(), raw);
         Ok(())
     }
 
@@ -1929,10 +1942,9 @@ impl ChatClient {
         let chat_request_cache_key = chat_request.cache_key();
         // LEGACY CACHE KEY MIGRATION (can be removed in a future version)
         let legacy_cache_key = chat_request.legacy_cache_key();
-        let chat_request = serde_json::to_string(chat_request).ok()?;
 
         // First, check the cache
-        if let Some(response) = self.lru.get(&chat_request) {
+        if let Some(response) = self.lru.get(&chat_request_cache_key) {
             return Some(map_response(response.clone()));
         }
 
