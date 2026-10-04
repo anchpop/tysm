@@ -238,6 +238,13 @@ pub const MODELS: &[ModelCost] = &[
     // (confirmed 2026-09-14)
     model("claude-fable-5-1", 10.0, None, 50.0),
     model("claude-mythos-5-1", 10.0, None, 50.0),
+    // Released 2026-09-22, 20% below Opus 5 ($5.00/$25.00). Cache-hit reads
+    // are 0.05x base input rather than the usual 0.1x; this crate does not
+    // record cache-hit rates for Anthropic models, so that distinction is
+    // invisible here. https://platform.claude.com/docs/en/about-claude/pricing
+    // (confirmed 2026-09-28)
+    model("claude-opus-5.5", 4.0, None, 20.0),
+    model("claude-opus-5-5", 4.0, None, 20.0),
     model("claude-opus-5", 5.0, None, 25.0),
     model("claude-opus-4-8", 5.0, None, 25.0),
     model("claude-opus-4-7", 5.0, None, 25.0),
@@ -453,7 +460,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-09-22";
+pub const RATE_CARD_VERSION: &str = "2026-09-28";
 
 /// The cost in dollars of a **single** request.
 ///
@@ -562,6 +569,8 @@ mod tests {
         for (id, expected) in [
             ("claude-opus-4-5-20251101", "claude-opus-4-5"),
             ("claude-opus-4.5", "claude-opus-4.5"),
+            ("claude-opus-5-5-20260922", "claude-opus-5-5"),
+            ("claude-opus-5.5", "claude-opus-5.5"),
             ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
             ("claude-haiku-4-5-20251001", "claude-haiku-4-5"),
             ("claude-opus-4-20250514", "claude-opus-4"),
