@@ -239,6 +239,13 @@ pub const MODELS: &[ModelCost] = &[
     model("claude-fable-5-1", 10.0, None, 50.0),
     model("claude-mythos-5-1", 10.0, None, 50.0),
     model("claude-opus-5", 5.0, None, 25.0),
+    // Opus 5.5 is cheaper than Opus 5 ($4/$20 vs $5/$25), and both spellings
+    // are listed because the `claude-opus-5` prefix would otherwise win and
+    // bill it at Opus 5's rate. Cache hits are 0.05x base input, which this
+    // crate does not record for Anthropic models.
+    // https://platform.claude.com/docs/en/about-claude/pricing (confirmed 2026-10-05)
+    model("claude-opus-5.5", 4.0, None, 20.0),
+    model("claude-opus-5-5", 4.0, None, 20.0),
     model("claude-opus-4-8", 5.0, None, 25.0),
     model("claude-opus-4-7", 5.0, None, 25.0),
     model("claude-opus-4-6", 5.0, None, 25.0),
@@ -453,7 +460,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-09-22";
+pub const RATE_CARD_VERSION: &str = "2026-10-05";
 
 /// The cost in dollars of a **single** request.
 ///
