@@ -1,7 +1,6 @@
-//! Chat completions are the most common way to interact with the OpenAI API.
-//! This module provides a client for interacting with the ChatGPT API.
-//!
-//! It also provides a batch API for processing large numbers of requests asynchronously.
+//! Typed chat and batch calls for OpenAI and Anthropic.
+//! `claude-*` models use the native Messages API; other models default to
+//! OpenAI-compatible Chat Completions. See [`Provider`] for explicit selection.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -17,9 +16,13 @@ use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
 use crate::batch::{Batch, BatchClient, BatchRequestItem, BatchStatus};
 use crate::schema::OpenAiTransform;
-use crate::utils::{api_key, OpenAiApiKeyError};
+use crate::utils::ApiKeyError;
 use crate::OpenAiError;
 use log::{debug, info, warn};
+
+#[path = "anthropic.rs"]
+mod anthropic;
+pub use anthropic::Provider;
 
 /// To use this library, you need to create a [`ChatClient`]. This contains various information needed to interact with the ChatGPT API,
 /// such as the API key, the model to use, and the URL of the API.
@@ -30,7 +33,7 @@ use log::{debug, info, warn};
 /// let client = ChatClient::new("sk-1234567890", "gpt-4o");
 /// ```
 ///
-/// ```rust
+/// ```rust,no_run
 /// # use tysm::chat_completions::ChatClient;
 /// // Create a client using an API key stored in an `OPENAI_API_KEY` environment variable.
 /// // (This will also look for an `.env` file in the current directory.)
@@ -38,6 +41,8 @@ use log::{debug, info, warn};
 /// ```
 #[non_exhaustive]
 pub struct ChatClient {
+    /// Native API provider; inferred from the model by the constructors.
+    pub provider: Provider,
     /// The API key to use for the ChatGPT API.
     pub api_key: String,
     /// The URL of the ChatGPT API. Customize this if you are using a custom API that is compatible with OpenAI's.
@@ -585,6 +590,10 @@ pub struct PromptTokenDetails {
     /// OpenAI automatically caches tokens that are used in a previous request.
     /// This reduces input cost.
     pub cached_tokens: u32,
+    /// Anthropic input tokens written to its five-minute prompt cache.
+    pub cache_creation_5m_tokens: u32,
+    /// Anthropic input tokens written to its one-hour prompt cache.
+    pub cache_creation_1h_tokens: u32,
 }
 
 /// Includes details about the completion tokens for reasoning models
@@ -630,6 +639,8 @@ impl std::ops::Add for PromptTokenDetails {
     fn add(self, rhs: Self) -> Self::Output {
         Self {
             cached_tokens: self.cached_tokens + rhs.cached_tokens,
+            cache_creation_5m_tokens: self.cache_creation_5m_tokens + rhs.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: self.cache_creation_1h_tokens + rhs.cache_creation_1h_tokens,
         }
     }
 }
@@ -690,13 +701,20 @@ fn retry_delay(error: &ChatError, attempt: u32) -> Option<std::time::Duration> {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ChatError {
+    /// A native provider returned a non-successful HTTP status.
+    #[error("Provider HTTP {status}: {body}")]
+    HttpStatus {
+        /// HTTP status code.
+        status: u16,
+        /// Response body, with no request credentials.
+        body: String,
+    },
+    /// Invalid provider configuration or an unsuccessful native API response.
+    #[error("Provider error: {0}")]
+    Provider(String),
     /// An error occurred when sending the request to the API.
     #[error("Request error: {0}")]
     RequestError(#[from] reqwest::Error),
-
-    /// An error occurred when serializing the request to JSON.
-    #[error("JSON serialization error: {0}")]
-    JsonSerializeError(serde_json::Error, ChatRequest),
 
     /// The API did not return a JSON object.
     #[error("API did not return a JSON object: {response} (request: {request})")]
@@ -747,6 +765,9 @@ pub enum ChatError {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum BatchChatError {
+    /// An error from a native provider's batch transport or protocol.
+    #[error("Native batch error: {0}")]
+    Provider(#[from] ChatError),
     /// An error occurred when uploading the file to the API.
     #[error("Error uploading file")]
     FileUploadError(#[from] crate::files::FilesError),
@@ -851,11 +872,14 @@ impl ChatClient {
     /// let client = ChatClient::new("sk-1234567890", "gpt-4o");
     /// ```
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let provider = Provider::for_model(&model);
         Self {
+            provider,
             api_key: api_key.into(),
-            base_url: url::Url::parse("https://api.openai.com/v1/").unwrap(),
+            base_url: url::Url::parse(provider.base_url()).unwrap(),
             chat_completions_path: "chat/completions".to_string(),
-            model: model.into(),
+            model,
             lru: DashMap::new(),
             usage: RwLock::new(ChatUsage::default()),
             batch_usage: RwLock::new(ChatUsage::default()),
@@ -868,7 +892,7 @@ impl ChatClient {
             extra_body: None,
             small_batch_threshold: 0,
             semaphore: Semaphore::new(100),
-            http_client: crate::utils::pooled_client(),
+            http_client: provider.http_client(),
             cached_only: false,
             cache_fallbacks: Vec::new(),
         }
@@ -939,7 +963,9 @@ impl ChatClient {
         self
     }
 
-    /// Set the reasoning effort for requests (e.g., "low", "medium", "high")
+    /// Set reasoning effort. For Anthropic, low/medium/high/xhigh/max map to
+    /// `output_config.effort` with adaptive thinking, and minimal maps to low.
+    /// `none` is rejected; omit the option to use the model's default.
     pub fn with_reasoning_effort(mut self, reasoning_effort: impl Into<String>) -> Self {
         self.reasoning_effort = Some(reasoning_effort.into());
         self
@@ -983,10 +1009,11 @@ impl ChatClient {
 
     /// Sets the base URL
     ///
+    /// Claude uses the native Anthropic API automatically; no URL override is needed.
+    ///
     /// ```
     /// # use tysm::chat_completions::ChatClient;
-    /// let api_key = "YOUR ANTHROPIC API KEY HERE";
-    /// let client = ChatClient::new(api_key, "claude-3-7-sonnet-20250219").with_url("https://api.anthropic.com/v1/");
+    /// let client = ChatClient::new("YOUR ANTHROPIC API KEY", "claude-haiku-5-5");
     /// ```
     ///
     /// or...
@@ -1018,20 +1045,24 @@ impl ChatClient {
     }
 
     /// Create a new [`ChatClient`].
-    /// This will use the `OPENAI_API_KEY` environment variable to set the API key.
-    /// It will also look in the `.env` file for an `OPENAI_API_KEY` variable (using dotenv).
+    /// Uses `ANTHROPIC_API_KEY` for `claude-*` models, otherwise `OPENAI_API_KEY`.
+    /// With the default `dotenvy` feature, also reads a local `.env` file.
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tysm::chat_completions::ChatClient;
     /// let client = ChatClient::from_env("gpt-4o").unwrap();
     /// ```
-    pub fn from_env(model: impl Into<String>) -> Result<Self, OpenAiApiKeyError> {
-        Ok(Self::new(api_key()?, model))
+    pub fn from_env(model: impl Into<String>) -> Result<Self, ApiKeyError> {
+        let model = model.into();
+        Ok(Self::new(
+            crate::utils::api_key_for(Provider::for_model(&model).api_key_env())?,
+            model,
+        ))
     }
 
     /// Send a chat message to the API and deserialize the response into the given type.
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tysm::chat_completions::ChatClient;
     /// #  let client = {
     /// #     let my_api = url::Url::parse("https://g7edusstdonmn3vxdh3qdypkrq0wzttx.lambda-url.us-east-1.on.aws/v1/").unwrap();
@@ -1067,7 +1098,7 @@ impl ChatClient {
     /// Send a chat message to the API and deserialize the response into the given type.
     /// The first argument, the system prompt, is used to tell the AI how to behave during the conversation.
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tysm::chat_completions::ChatClient;
     /// #  let client = {
     /// #     let my_api = url::Url::parse("https://g7edusstdonmn3vxdh3qdypkrq0wzttx.lambda-url.us-east-1.on.aws/v1/").unwrap();
@@ -1105,7 +1136,7 @@ impl ChatClient {
     /// Send a sequence of chat messages to the API and deserialize the response into the given type.
     /// This is useful for more advanced use cases like chatbots, multi-turn conversations, or when you need to use [Vision](https://platform.openai.com/docs/guides/vision).
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tysm::chat_completions::ChatClient;
     /// #  let client = {
     /// #     let my_api = url::Url::parse("https://g7edusstdonmn3vxdh3qdypkrq0wzttx.lambda-url.us-east-1.on.aws/v1/").unwrap();
@@ -1145,7 +1176,7 @@ impl ChatClient {
         &self,
         messages: Vec<ChatMessage>,
     ) -> Result<T, ChatError> {
-        let json_schema = JsonSchemaFormat::new::<T>();
+        let json_schema = self.json_schema_format::<T>();
 
         let response_format = ResponseFormat::JsonSchema {
             json_schema: json_schema.clone(),
@@ -1193,7 +1224,10 @@ impl ChatClient {
             extra_body: self.extra_body.clone(),
         };
 
-        let chat_request_str = serde_json::to_string(&chat_request).unwrap();
+        let chat_request_str = match self.provider {
+            Provider::OpenAi => serde_json::to_string(&chat_request).unwrap(),
+            Provider::Anthropic => anthropic::request_body(&chat_request)?.to_string(),
+        };
 
         let process_result = |cached_response: String| -> Result<(T, ChatUsage), ChatError> {
             let cached_response = match serde_json::from_str::<serde_json::Value>(&cached_response)
@@ -1243,6 +1277,10 @@ impl ChatClient {
                     return Err(ChatError::ApiError(error, chat_request_str));
                 }
             };
+            if response.object == "message" {
+                let content = anthropic::response_content(&response)?;
+                return map_response(content).map(|mapped| (mapped, response.usage));
+            }
             let choice = response
                 .choices
                 .into_iter()
@@ -1319,9 +1357,9 @@ impl ChatClient {
                 match outcome {
                     Ok(outcome) => break outcome,
                     Err(error) => {
-                        match retry_delay(&error, attempt)
-                            .filter(|_| attempt < LIVE_REQUEST_ATTEMPTS)
-                        {
+                        match retry_delay(&error, attempt).filter(|_| {
+                            self.provider == Provider::OpenAi && attempt < LIVE_REQUEST_ATTEMPTS
+                        }) {
                             Some(delay) => {
                                 warn!(
                                     "Chat request to {} failed on attempt \
@@ -1338,12 +1376,14 @@ impl ChatClient {
                 }
             }
         };
-        *self.usage.write().unwrap() += usage;
-        self.record_spend(self.service_tier.as_deref(), usage, 1.0);
+        if self.provider == Provider::OpenAi {
+            *self.usage.write().unwrap() += usage;
+            self.record_spend(self.service_tier.as_deref(), usage, 1.0);
+        }
 
         // cache the response
         {
-            let chat_request_cache_key = chat_request.cache_key();
+            let chat_request_cache_key = self.cache_key(&chat_request);
 
             if let Some(cache_directory) = &self.cache_directory {
                 // Compress the response with zstd before writing to disk
@@ -1446,7 +1486,7 @@ impl ChatClient {
         messages: Vec<Vec<ChatMessage>>,
         on_progress: impl FnMut(&crate::batch::Batch),
     ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
-        let json_schema = JsonSchemaFormat::new::<T>();
+        let json_schema = self.json_schema_format::<T>();
 
         let response_format = ResponseFormat::JsonSchema {
             json_schema: json_schema.clone(),
@@ -1538,6 +1578,9 @@ impl ChatClient {
             };
             match response {
                 ChatResponseOrError::Response(response) => {
+                    if response.object == "message" {
+                        return Some(anthropic::response_content(&response));
+                    }
                     let Some(choice) = response.choices.into_iter().next() else {
                         continue;
                     };
@@ -1562,10 +1605,14 @@ impl ChatClient {
         let raw = serde_json::to_string(response).expect("ChatResponse is serializable");
         if let Some(cache_directory) = &self.cache_directory {
             let compressed = zstd::encode_all(raw.as_bytes(), 3)?;
-            crate::cache::write_to_cache_dir(cache_directory, &request.cache_key(), &compressed)
-                .await?;
+            crate::cache::write_to_cache_dir(
+                cache_directory,
+                &self.cache_key(request),
+                &compressed,
+            )
+            .await?;
         }
-        self.lru.insert(request.cache_key(), raw);
+        self.lru.insert(self.cache_key(request), raw);
         Ok(())
     }
 
@@ -1653,17 +1700,23 @@ impl ChatClient {
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
+        if self.provider == Provider::Anthropic {
+            return self
+                .anthropic_batch(misses, output, &mut on_progress, map_response)
+                .await;
+        }
+
         // Send the uncached requests live instead of batching when there are
         // too few to be worth a batch's fixed overhead (or always, under
-        // `with_no_batch`). Decided on `misses`, not the caller's total, so a
-        // retry whose responses are nearly all cached skips the queue entirely.
-        let send_live = misses.len() <= self.small_batch_threshold;
+        // `with_no_batch`). Decided on what is still unanswered, not the
+        // caller's total, so a retry whose responses are nearly all cached, or
+        // whose in-flight batch is stuck on its last few, skips the queue.
         let batch_client = BatchClient::from(self);
         let existing = match self.find_batch_by_hash(&batch_client, &misses).await {
             Ok(existing) => existing,
             // Live mode must work against an endpoint that has no Batch API at
             // all; there is nothing to harvest there.
-            Err(error) if send_live => {
+            Err(error) if misses.len() <= self.small_batch_threshold => {
                 warn!("could not look for an existing batch, sending live: {error}");
                 None
             }
@@ -1671,7 +1724,15 @@ impl ChatClient {
         };
         if let Some(mut batch) = existing {
             if !batch.status.is_terminal() {
-                if send_live && batch.status != BatchStatus::Cancelling {
+                // Its completed results are harvested below, so only the
+                // requests it still owes would go live. Its own total reads 0
+                // while validating, so count from our misses instead.
+                let outstanding = misses
+                    .len()
+                    .saturating_sub(batch.request_counts.completed as usize);
+                if outstanding <= self.small_batch_threshold
+                    && batch.status != BatchStatus::Cancelling
+                {
                     warn!(
                         "sending live: cancelling in-flight batch {} for these requests \
                          and harvesting its completed results",
@@ -1709,7 +1770,7 @@ impl ChatClient {
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
-        if send_live {
+        if misses.len() <= self.small_batch_threshold {
             info!(
                 "Sending {} uncached request(s) live instead of batching",
                 misses.len()
@@ -1944,9 +2005,13 @@ impl ChatClient {
         chat_request: &ChatRequest,
         map_response: impl FnOnce(String) -> Result<T, ChatError>,
     ) -> Option<Result<T, ChatError>> {
-        let chat_request_cache_key = chat_request.cache_key();
+        let chat_request_cache_key = self.cache_key(chat_request);
         // LEGACY CACHE KEY MIGRATION (can be removed in a future version)
-        let legacy_cache_key = chat_request.legacy_cache_key();
+        let legacy_cache_key = if self.provider == Provider::OpenAi {
+            chat_request.legacy_cache_key()
+        } else {
+            chat_request_cache_key.clone()
+        };
 
         // First, check the cache
         if let Some(response) = self.lru.get(&chat_request_cache_key) {
@@ -2013,7 +2078,7 @@ impl ChatClient {
         // LEGACY CACHE KEY MIGRATION (can be removed in a future version)
         // Try the legacy cache key (pre-v0.17.1 format with duplicate additionalProperties).
         // If found, copy to the new cache key so future lookups use the new format.
-        else if legacy_cache_key != chat_request_cache_key {
+        else if self.provider == Provider::OpenAi && legacy_cache_key != chat_request_cache_key {
             find_in_cache(&legacy_cache_key, &chat_request_cache_key).await?
         }
         // END LEGACY CACHE KEY MIGRATION
@@ -2032,6 +2097,10 @@ impl ChatClient {
 
     async fn chat_uncached(&self, chat_request: &ChatRequest) -> Result<String, ChatError> {
         let _permit = self.semaphore.acquire().await.unwrap();
+
+        if self.provider == Provider::Anthropic {
+            return self.anthropic_chat(chat_request).await;
+        }
 
         let response = self
             .http_client
@@ -2890,6 +2959,61 @@ mod retry_tests {
             );
         }
     }
+    #[tokio::test]
+    async fn batch_stuck_on_its_last_requests_is_cancelled_even_when_misses_exceed_threshold() {
+        // Three misses exceed the threshold, but the in-flight batch has
+        // answered one: cancel it, harvest, and send the rest live.
+        let cache = tempfile::tempdir().unwrap();
+        let mut client = ChatClient::new("unused", "gpt-4o-mini")
+            .with_cache_directory(cache.path())
+            .with_small_batch_threshold(2);
+        let prompts = vec![
+            (vec![ChatMessage::user("alpha")], ResponseFormat::Text),
+            (vec![ChatMessage::user("beta")], ResponseFormat::Text),
+            (vec![ChatMessage::user("alpha")], ResponseFormat::Text),
+        ];
+        let requests = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, (m, f))| (i, client.request_for_messages(m.clone(), f.clone())))
+            .collect::<Vec<_>>();
+        let hash = ChatClient::batch_hash(&requests);
+        let (url, task) = server(vec![
+            (
+                "GET /v1/batches?limit=100 ",
+                serde_json::json!({"object":"list", "data":[batch_json("in_progress", None, &hash)], "has_more":false})
+                    .to_string(),
+            ),
+            (
+                "POST /v1/batches/batch-test/cancel ",
+                batch_json("cancelling", None, &hash).to_string(),
+            ),
+            (
+                "GET /v1/batches/batch-test ",
+                batch_json("cancelled", Some("output"), &hash).to_string(),
+            ),
+            (
+                "GET /v1/files/output/content ",
+                result_line(ChatClient::batch_custom_id(&requests[0].1), "harvested"),
+            ),
+            (
+                "POST /v1/chat/completions ",
+                response_json("live").to_string(),
+            ),
+        ])
+        .await;
+        client.base_url = url;
+        let results = client
+            .batch_chat_with_messages_raw(prompts, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            ["harvested", "live", "harvested"]
+        );
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn harvest_reports_item_errors_refusals_and_mapping_failures_per_item() {
         let mut client = ChatClient::new("unused", "gpt-4o-mini");

@@ -1,8 +1,8 @@
 //! # `tysm` - Thank You So Much
 //!
-//! Typed OpenAI Chat Completions.
+//! Typed OpenAI and Anthropic chat and batch calls.
 //!
-//! A strongly-typed Rust client for OpenAI's ChatGPT API that enforces type-safe responses using [Structured Outputs](https://platform.openai.com/docs/guides/structured-outputs).
+//! A strongly-typed Rust client that enforces type-safe responses using native structured outputs. `claude-*` models automatically select Anthropic's Messages API.
 //!
 //! This library uses the [schemars](https://docs.rs/schemars/latest/schemars/index.html) crate to generate a schema for the desired response type. It also uses [serde](https://docs.rs/serde/latest/serde/index.html) to deserialize the response into the desired type. Install these crates like so:
 //!
@@ -53,7 +53,7 @@ pub mod model_prices;
 mod schema;
 mod utils;
 
-pub use utils::OpenAiApiKeyError;
+pub use utils::ApiKeyError;
 
 /// Emitted by the OpenAI API when an error occurs.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
