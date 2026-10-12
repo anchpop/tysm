@@ -323,7 +323,8 @@ impl EmbeddingsClient {
             let hash = const_xxh3(debug_repr.as_bytes());
 
             // Check if we should start a new chunk (1/256 chance or chunk is full)
-            #[allow(unknown_lints, clippy::manual_is_multiple_of)] // is_multiple_of requires Rust > 1.85.
+            // is_multiple_of requires Rust > 1.85.
+            #[allow(unknown_lints, clippy::manual_is_multiple_of)]
             let should_split = (hash % 256) == 0 && !current_chunk.is_empty();
             let chunk_full = current_chunk.len() >= self.batch_size;
 
