@@ -68,7 +68,7 @@ struct Usage {
 use thiserror::Error;
 
 use crate::{
-    utils::{api_key, OpenAiApiKeyError},
+    utils::{api_key, ApiKeyError},
     OpenAiError,
 };
 
@@ -267,11 +267,11 @@ impl EmbeddingsClient {
     /// This will use the `OPENAI_API_KEY` environment variable to set the API key.
     /// It will also look in the `.env` file for an `OPENAI_API_KEY` variable (using dotenv).
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tysm::embeddings::EmbeddingsClient;
     /// let client = EmbeddingsClient::from_env("gpt-4o").unwrap();
     /// ```
-    pub fn from_env(model: impl Into<String>) -> Result<Self, OpenAiApiKeyError> {
+    pub fn from_env(model: impl Into<String>) -> Result<Self, ApiKeyError> {
         Ok(Self::new(api_key()?, model))
     }
 
@@ -323,6 +323,8 @@ impl EmbeddingsClient {
             let hash = const_xxh3(debug_repr.as_bytes());
 
             // Check if we should start a new chunk (1/256 chance or chunk is full)
+            // is_multiple_of requires Rust > 1.85.
+            #[allow(unknown_lints, clippy::manual_is_multiple_of)]
             let should_split = (hash % 256) == 0 && !current_chunk.is_empty();
             let chunk_full = current_chunk.len() >= self.batch_size;
 

@@ -5,7 +5,7 @@ members = ["model-prices"]
 name = "tysm"
 version = "0.22.0"
 edition = "2021"
-description = "Batteries-included Rust OpenAI Client"
+description = "Batteries-included Rust OpenAI and Anthropic client"
 license = "MIT"
 homepage = "https://github.com/not-pizza/tysm"
 repository = "https://github.com/not-pizza/tysm"
@@ -33,7 +33,7 @@ tynm = "0.1.10"
 lru = "0.12.5"
 schemars = { version = "1.0.1", features = ["preserve_order"] }
 tokio = { version = "1.21.2", features = ["fs", "time"] }
-tokio-util = { version = "0.7.10", features = ["codec"] }
+tokio-util = { version = "0.7.10", features = ["codec", "io"] }
 url = "2.5.4"
 xxhash-rust = { version = "0.8.15", features = ["xxh3", "const_xxh3"] }
 zstd = "0.13.3"

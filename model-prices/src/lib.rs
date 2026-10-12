@@ -27,6 +27,10 @@ pub struct CallTokens {
     /// Prompt tokens the vendor served from cache — a subset of `prompt`,
     /// billed at the cheaper cached rate.
     pub cached_prompt: u32,
+    /// Prompt tokens written to Anthropic's five-minute cache (included in `prompt`).
+    pub cache_creation_5m: u32,
+    /// Prompt tokens written to Anthropic's one-hour cache (included in `prompt`).
+    pub cache_creation_1h: u32,
     /// Generated tokens, reasoning included. Vendors that report reasoning
     /// separately from completion must add the two before setting this, since
     /// both are billed at the output rate.
@@ -210,45 +214,40 @@ const GPT_5_LONG_CONTEXT: u32 = 272_000;
 /// single local edit, and a tier the vendor sells but we have not filled in is
 /// visible as a missing `.flex()` rather than hidden in a second table.
 pub const MODELS: &[ModelCost] = &[
-    // Anthropic
-    //
-    // Both spellings of a point release are listed. The API's own ids use
-    // dashes (`claude-opus-4-5-20251101`), and with only the dotted spelling
-    // present the longest-prefix match falls back to the major version —
-    // billing Opus 4.5 at Opus 4's $15/$75 instead of $5/$25.
-    model("claude-opus-4.5", 5.0, None, 25.0),
-    model("claude-opus-4-5", 5.0, None, 25.0),
-    model("claude-opus-4.1", 15.0, None, 75.0),
-    model("claude-opus-4-1", 15.0, None, 75.0),
-    model("claude-opus-4", 15.0, None, 75.0),
-    model("claude-sonnet-4.5", 3.0, None, 15.0),
-    model("claude-sonnet-4-5", 3.0, None, 15.0),
-    model("claude-sonnet-4", 3.0, None, 15.0),
-    model("claude-haiku-4", 0.80, None, 4.0),
-    model("claude-3-opus", 15.0, None, 75.0),
-    model("claude-3-7-sonnet", 3.0, None, 15.0),
-    model("claude-3-5-haiku", 0.80, None, 4.0),
-    // Anthropic (new models, copied from https://platform.claude.com/docs/en/about-claude/pricing on 2026-07-06)
-    model("claude-fable-5", 10.0, None, 50.0),
-    model("claude-mythos-5", 10.0, None, 50.0),
-    // Same headline rate as Fable 5 / Mythos 5, but a steeper cache-hit
-    // discount (0.025x base input vs the usual 0.1x). This crate does not
-    // record cache-hit rates for Anthropic models, so that distinction is
-    // invisible here. https://platform.claude.com/docs/en/about-claude/pricing
-    // (confirmed 2026-09-14)
-    model("claude-fable-5-1", 10.0, None, 50.0),
-    model("claude-mythos-5-1", 10.0, None, 50.0),
-    model("claude-opus-5", 5.0, None, 25.0),
-    model("claude-opus-4-8", 5.0, None, 25.0),
-    model("claude-opus-4-7", 5.0, None, 25.0),
-    model("claude-opus-4-6", 5.0, None, 25.0),
-    model("claude-sonnet-4-6", 3.0, None, 15.0),
-    // Launched as introductory pricing through 2026-08-31 with an announced
-    // increase to 3.0/15.0 on 2026-09-01; that increase was cancelled and
-    // 2.0/10.0 is now the standard, permanent price.
-    // https://platform.claude.com/docs/en/about-claude/pricing (confirmed 2026-09-14)
-    model("claude-sonnet-5", 2.0, None, 10.0),
-    model("claude-haiku-4-5", 1.0, None, 5.0),
+    // Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
+    // Checked 2026-10-08. Cache writes are 1.25x (5m) / 2x (1h) base input;
+    // batch discounts stack with both reads and writes.
+    model("claude-opus-4.5", 5.0, Some(0.50), 25.0),
+    model("claude-opus-4-5", 5.0, Some(0.50), 25.0),
+    model("claude-opus-4.1", 15.0, Some(1.50), 75.0),
+    model("claude-opus-4-1", 15.0, Some(1.50), 75.0),
+    model("claude-opus-4", 15.0, Some(1.50), 75.0),
+    model("claude-sonnet-4.5", 3.0, Some(0.30), 15.0),
+    model("claude-sonnet-4-5", 3.0, Some(0.30), 15.0),
+    model("claude-sonnet-4", 3.0, Some(0.30), 15.0),
+    model("claude-haiku-4", 0.80, Some(0.08), 4.0),
+    model("claude-3-opus", 15.0, Some(1.50), 75.0),
+    model("claude-3-7-sonnet", 3.0, Some(0.30), 15.0),
+    model("claude-3-5-haiku", 0.80, Some(0.08), 4.0),
+    model("claude-fable-5", 10.0, Some(1.0), 50.0),
+    model("claude-mythos-5", 10.0, Some(1.0), 50.0),
+    model("claude-fable-5-1", 10.0, Some(0.25), 50.0),
+    model("claude-mythos-5-1", 10.0, Some(0.25), 50.0),
+    model("claude-opus-5-5", 4.0, Some(0.20), 20.0),
+    model("claude-opus-5", 5.0, Some(0.50), 25.0),
+    model("claude-opus-4-8", 5.0, Some(0.50), 25.0),
+    model("claude-opus-4-7", 5.0, Some(0.50), 25.0),
+    model("claude-opus-4-6", 5.0, Some(0.50), 25.0),
+    model("claude-sonnet-4-6", 3.0, Some(0.30), 15.0),
+    model("claude-sonnet-5-5", 2.0, Some(0.10), 10.0),
+    model("claude-sonnet-5", 2.0, Some(0.20), 10.0),
+    model("claude-haiku-5-5", 0.10, Some(0.01), 0.50).long_context(long(
+        100_000,
+        0.50,
+        Some(0.05),
+        2.50,
+    )),
+    model("claude-haiku-4-5", 1.0, Some(0.10), 5.0),
     // OpenAI
     // Copied from https://platform.openai.com/docs/pricing on 2026-03-17
     model("gpt-4.1", 2.00, Some(0.50), 8.00),
@@ -453,7 +452,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-09-22";
+pub const RATE_CARD_VERSION: &str = "2026-10-08";
 
 /// The cost in dollars of a **single** request.
 ///
@@ -462,7 +461,9 @@ pub const RATE_CARD_VERSION: &str = "2026-09-22";
 /// wrong — answer for any model with a [`LongContext`] card, because the
 /// premium keys off one request's prompt size.
 ///
-/// Returns `None` for a model we have no price for.
+/// Returns `None` for a model we have no price for. Passing `Some("batch")`
+/// prices the call at 50% of standard rates, including cache reads and writes;
+/// this is an accounting option, not an API `service_tier` value.
 pub fn cost_of_call(model: &str, service_tier: Option<&str>, tokens: CallTokens) -> Option<f64> {
     cost_of_call_split(model, service_tier, tokens).map(|(input, output)| input + output)
 }
@@ -479,11 +480,19 @@ pub fn cost_of_call_split(
     let cached = tokens.cached_prompt.min(tokens.prompt);
     let uncached = tokens.prompt - cached;
 
-    Some(model_cost.rates(service_tier, tokens.prompt).charge_split(
-        uncached,
-        cached,
-        tokens.output,
-    ))
+    let rates = model_cost.rates(service_tier, tokens.prompt);
+    let (mut input, output) = rates.charge_split(uncached, cached, tokens.output);
+    // Writes are already included at 1x in uncached input. Add only the
+    // premium: 5m writes are 1.25x, 1h writes 2x. Batch halves all rates.
+    input += rates.input
+        * (0.25 * tokens.cache_creation_5m as f64 + tokens.cache_creation_1h as f64)
+        / 1_000_000.0;
+    let discount = if service_tier == Some("batch") {
+        0.5
+    } else {
+        1.0
+    };
+    Some((input * discount, output * discount))
 }
 
 #[cfg(test)]
@@ -495,6 +504,7 @@ mod tests {
             prompt,
             cached_prompt,
             output,
+            ..Default::default()
         }
     }
 

@@ -1,6 +1,6 @@
 # tysm - Thank You So Much
 
-**Batteries-included Rust OpenAI Client**
+**Batteries-included Rust client for OpenAI and Anthropic**
 
 Including...
 
@@ -144,12 +144,9 @@ fn main() {
 }
 ```
 
-The cache is stored as a few big append-only **record-log** shard files (`000.kv` …
-`999.kv`) rather than one file per entry, which keeps the directory to ~1000 files and
-makes it cheap to mirror to object storage (e.g. with [`osmo`](https://github.com/anchpop/osmo),
-whose `records` strategy understands the same format and merges shards losslessly across
-machines). An older `dir/<shard>/<key>` cache is migrated automatically the first time each
-shard is touched; call [`tysm::cache::migrate`] to fold the whole directory up-front.
+The cache is an [`osmo`](https://github.com/anchpop/osmo) append-only store under the
+`tysm/` namespace. Live and batch requests share entries. Use
+`tysm::cache::migrate_legacy` to import older `.kv` shards or per-entry directories.
 
 ### Custom API URL
 
@@ -164,26 +161,49 @@ By the way, feel free to use this endpoint if you want, but I don't promise to m
 
 #### "I want to use Anthropic!"
 
-Anthropic has some limited [OpenAI compatibility](https://docs.anthropic.com/en/api/openai-sdk). But at the time of this writing, they ignore the `response_format` parameter. This means the structured outputs stuff is not going to work. However, you can still use the `ChatClient::chat_with_messages_raw` function just fine:
+Models named `claude-*` automatically use the native Messages and Message Batches APIs, authenticated with `ANTHROPIC_API_KEY`. No URL override or OpenAI compatibility shim is involved:
 
 ```rust
-use tysm::chat_completions::{ChatClient, ChatMessage, ResponseFormat};
-let api_key = std::env::var("ANTHROPIC_API_KEY").unwrap();
-let client = ChatClient::new(api_key, "claude-3-7-sonnet-20250219").with_url("https://api.anthropic.com/v1/");
-let response = client
-  .chat_with_messages_raw(
-      vec![
-          ChatMessage::system("System prompt goes here"),
-          ChatMessage::user("User message goes here"),
-      ],
-      ResponseFormat::Text, // ignored
-  )
-  .await?;
+use tysm::chat_completions::ChatClient;
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Answer { value: u32 }
+
+let client = ChatClient::from_env("claude-haiku-5-5")?
+    .with_cache_directory("./cache")
+    .with_reasoning_effort("low");
+let answer: Answer = client.chat("What is 6 times 7?").await?;
+let answers = client.batch_chat::<Answer>(vec!["What is 1 + 2?", "What is 3 + 4?"], |_| {}).await?;
 ```
 
-However, if you can get Claude to output JSON on one line, the non-raw methods may still work. This is because, in the event that the response cannot be decoded into the expected type, `tysm` will then attempt to decode each line individually. 
+`with_provider(Provider::Anthropic)` / `with_provider(Provider::OpenAi)` overrides inference and resets the base URL and HTTP client; call `with_url` afterwards for a proxy. The override does not replace the API key. The low-level `batch::BatchClient` and file/embedding clients remain OpenAI-specific; use `ChatClient::batch_*` for provider-neutral batching.
 
-The Batch API will also not work against Anthropic's API.
+**Requests.** Typed calls use native `output_config.format` JSON schemas. `with_reasoning_effort` maps `low`, `medium`, `high`, `xhigh`, and `max` directly to `output_config.effort`, with adaptive thinking; OpenAI's `minimal` maps to `low`. `none` is rejected rather than silently enabling thinking (current Sonnet/Opus/Fable cannot disable it). Omitting effort leaves the model's default. Older Claude models may reject adaptive thinking or effort; this adapter targets current models. The default `max_tokens` is 16,384. Override it and other native parameters with `with_extra_body`:
+
+```rust
+let client = client.with_extra_body(serde_json::json!({
+    "max_tokens": 8192,
+    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+}));
+```
+
+This opt-in automatic prompt caching is separate from tysm's exact-response cache. Anthropic's cache hits are prefix-based and have model-specific minimum token counts; batch hits are best-effort. `prompt_cache_key` and `service_tier="flex"` are OpenAI-only and are rejected. Anthropic accepts `auto` / `standard_only` tiers. Text and URL/base64 images are supported; audio and explicit OpenAI image-detail settings are rejected. System messages must precede the conversation. Raw `Text` works; schema-less `JsonObject` does not. Extra parameters cannot replace the model, messages, system prompt, response schema, or enable streaming.
+
+**Schemas.** The adapter closes objects, changes `oneOf` to `anyOf`, removes `$schema`, and moves unsupported numeric/string/array constraints into descriptions (including `minItems > 1`). Serde still checks the Rust result type, including integer ranges; arbitrary schemars validation annotations are not revalidated locally. Arbitrary-key maps are rejected locally rather than silently reduced to empty objects. Recursive schemas, external references, complex enums, and unsupported regexes are not emulated: Anthropic returns a non-retryable schema error. Refusals, truncations, and invalid typed responses are never cached.
+
+**Batches.** Duplicate prompts are submitted once. Batches split at 100,000 requests or 256 MB of serialized JSON (including wrappers), and all chunks are submitted before waiting. Every succeeded/errored/canceled/expired item is mapped back to its input slot. The callback keeps the existing `Batch` shape: `object="message_batch"`, native counts, and normalized status; OpenAI-only file IDs and timestamps are empty/zero. `cancel_anthropic_batch(id)` requests asynchronous cancellation, which is polled for up to ten minutes before returning an error that can be resumed. Retryable HTTP errors (429, 529, other 5xx, 408/409, transport failures) back off and honor numeric `Retry-After`.
+
+Pending job IDs are persisted alongside the response cache, indexed per exact request, so restarts or calls with a smaller subset resume rather than resubmit. Configure a persistent cache to survive process restarts; without one this only works on the same client. Under `with_no_batch` or the small-batch threshold, existing work is canceled/harvested before remaining misses go live. For OpenAI batches the threshold is compared with what an in-flight batch still owes, so a batch stuck on its last few requests is cancelled, harvested, and finished live. Pending IDs are cleared only after successful results are safely cached. As with any API without submission idempotency, a process dying between server acceptance and saving its batch ID can leave an untracked job.
+
+**Cache and billing.** Anthropic has a separate versioned cache namespace, including model, schema, messages and every request parameter. Live and batch calls share entries. Existing OpenAI keys remain unchanged. Spend includes cache reads and both 5-minute/1-hour writes; batch halves all these rates. Haiku 5.5's >100,000-token premium counts *all* input tokens, including cached tokens, and is applied per request. Failed/refused/truncated responses with usage are billed too.
+
+Offline tests run with `cargo test --workspace`. Paid smoke tests are ignored by default:
+
+```sh
+cargo test --test anthropic -- --ignored --nocapture
+```
+
+They exercise typed Haiku live calls, a real three-request batch, disk-cache reruns, batch-to-live cache sharing, and actual one-hour prompt-cache writes/reads. Set `ANTHROPIC_API_KEY` before running them.
 
 #### "I want to use Gemini!"
 

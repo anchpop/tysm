@@ -23,6 +23,12 @@ fn tokens_of(usage: ChatUsage) -> CallTokens {
             .prompt_tokens_details
             .map_or(0, |details| details.cached_tokens),
         output: usage.completion_tokens,
+        cache_creation_5m: usage
+            .prompt_tokens_details
+            .map_or(0, |d| d.cache_creation_5m_tokens),
+        cache_creation_1h: usage
+            .prompt_tokens_details
+            .map_or(0, |d| d.cache_creation_1h_tokens),
     }
 }
 
@@ -33,7 +39,9 @@ fn tokens_of(usage: ChatUsage) -> CallTokens {
 /// wrong — answer for any model with a [`LongContext`] card, because the
 /// premium keys off one request's prompt size.
 ///
-/// Returns `None` for a model we have no price for.
+/// Returns `None` for a model we have no price for. Passing `Some("batch")`
+/// prices the call at 50% of standard rates, including cache reads and writes;
+/// this is an accounting option, not an API `service_tier` value.
 pub fn cost_of_call(model: &str, service_tier: Option<&str>, usage: ChatUsage) -> Option<f64> {
     model_prices::cost_of_call(model, service_tier, tokens_of(usage))
 }
@@ -76,6 +84,7 @@ mod tests {
                 prompt: 2_000_000,
                 cached_prompt: 1_000_000,
                 output: 1_000_000,
+                ..Default::default()
             }
         );
 

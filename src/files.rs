@@ -9,7 +9,7 @@ use tokio::fs::File;
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::{
-    utils::{api_key, remove_trailing_slash, OpenAiApiKeyError},
+    utils::{api_key, remove_trailing_slash, ApiKeyError},
     OpenAiError,
 };
 
@@ -170,11 +170,11 @@ impl FilesClient {
     /// This will use the `OPENAI_API_KEY` environment variable to set the API key.
     /// It will also look in the `.env` file for an `OPENAI_API_KEY` variable (using dotenv).
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use tysm::files::FilesClient;
     /// let client = FilesClient::from_env().unwrap();
     /// ```
-    pub fn from_env() -> Result<Self, OpenAiApiKeyError> {
+    pub fn from_env() -> Result<Self, ApiKeyError> {
         Ok(Self::new(api_key()?))
     }
 
