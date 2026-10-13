@@ -47,9 +47,11 @@
 pub mod batch;
 pub mod cache;
 pub mod chat_completions;
+pub mod decisions;
 pub mod embeddings;
 pub mod files;
 pub mod model_prices;
+mod retry;
 mod schema;
 mod utils;
 

@@ -82,6 +82,50 @@ There are 4 basic methods on `ChatClient`. Each one is "lower level" than the pr
 Each one has a corresponding batch equivalent (`batch_chat`, `batch_chat_with_system_prompt`, `batch_chat_with_messages`, `batch_chat_with_messages_raw`). These go through the batch API, which is cheaper and has higher ratelimits, but is much higher-latency. The responses to the batch API stick around in OpenAI's servers for some time, and before starting a new batch request, `tysm` will automatically check if that same request has been made before (and reuse it if so). 
 
 
+## Decisions API
+
+```rust
+use tysm::decisions::{ChoiceOption, ChoiceQuestion, DecisionAnswer, DecisionsClient};
+
+let client = DecisionsClient::from_env("gpt-6-luna")?
+    .with_cache_directory("./cache")
+    .with_max_concurrent_requests(16);
+let response = client.decide("私の両親は東京に住んでいます。", &[ChoiceQuestion {
+    name: Some("reading".into()),
+    instructions: "Choose the reading of 両親 in this sentence.".into(),
+    choices: vec![ChoiceOption::new("りょうしん"), ChoiceOption::new("ふたおや")],
+}]).await?;
+for answer in response.answers {
+    match answer {
+        DecisionAnswer::Choice(answer) => println!("{:?}: {:?}", answer.choice, answer.probabilities),
+        DecisionAnswer::Refusal { name } => eprintln!("Refused: {name:?}"),
+    }
+}
+```
+
+This standalone client supports text input and finite choice questions (2–255 unique
+string or boolean values). Questions and choices keep their supplied order; no prompt
+is added. Confidence is reported separately from option probabilities. The response
+preserves the API's model and complete token usage, including provider cache details.
+
+Live requests only: OpenAI rejects `/v1/decisions` as a Batch API endpoint. Images,
+predicate/score questions, reasoning settings, and concurrent cache-miss deduplication
+are not implemented. `with_url` configures a compatible base URL. The default
+concurrency limit is 16. Transport failures (including closed connections), HTTP 429,
+server faults, and transient API capacity errors are retried up to four total attempts.
+Retries use the shared chat backoff (2/4/8 seconds for transport; 15/30/60 for capacity),
+or the server's integer-seconds `Retry-After` when supplied. HTTP-date headers are not
+parsed. Sleeping retries release their concurrency slot. Permanent errors and invalid
+responses are returned without retrying.
+
+Successful, validated responses (including explicit refusals) use a separate
+exact-response cache namespace keyed by the full serialized request and endpoint URL.
+HTTP errors and invalid responses are not cached. Persistent caching reuses results across
+fresh clients; cached usage describes the original request, not new spend. As with the
+other clients, cache directories contain response content: treat them as
+private. Run `cargo run --example decisions -- /tmp/decisions-cache` for Japanese and
+Mandarin sentence readings, full serialized responses, and cold/warm latency.
+
 ## Setup
 
 1. Get an API key from [OpenAI](https://platform.openai.com/api-keys).

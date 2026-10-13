@@ -15,6 +15,7 @@ use tokio::sync::Semaphore;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
 use crate::batch::{Batch, BatchClient, BatchRequestItem, BatchStatus};
+use crate::retry::{is_transient_api_error, RetryKind, LIVE_REQUEST_ATTEMPTS};
 use crate::schema::OpenAiTransform;
 use crate::utils::ApiKeyError;
 use crate::OpenAiError;
@@ -659,42 +660,15 @@ impl std::ops::Add for CompletionTokenDetails {
     }
 }
 
-/// How many times a live chat request is attempted before its error is returned.
-const LIVE_REQUEST_ATTEMPTS: u32 = 4;
-
-/// Whether an API error is one a later, identical request could succeed at.
-///
-/// The flex service tier answers `flex_unavailable` whenever OpenAI has no
-/// spare capacity; rate limits and server faults are the same shape of
-/// problem. In each case the request is fine and only the moment is wrong.
-pub(crate) fn is_transient_api_error(error: &OpenAiError) -> bool {
-    let code = error.code.as_deref().unwrap_or_default();
-    matches!(
-        code,
-        "flex_unavailable" | "resource_unavailable" | "rate_limit_exceeded" | "server_error"
-    ) || matches!(
-        error.r#type.as_str(),
-        "resource_unavailable" | "rate_limit_error" | "server_error"
-    )
-}
-
-/// How long to wait before retrying `error`, or `None` when retrying it would
-/// fail the same way however many times it is tried.
-///
-/// A transport error is usually a pooled keep-alive connection the server has
-/// already closed, surfacing on its next use; reconnecting fixes it at once.
-/// Capacity frees up on a scale of minutes rather than milliseconds, so those
-/// errors wait far longer. Anything else - a malformed request, a schema the
-/// model cannot satisfy - is returned as is.
+/// Map chat errors to the shared live-request backoff without changing which
+/// errors the chat transport retries.
 fn retry_delay(error: &ChatError, attempt: u32) -> Option<std::time::Duration> {
-    use std::time::Duration;
-    match error {
-        ChatError::RequestError(_) => Some(Duration::from_secs(1 << attempt)),
-        ChatError::ApiError(error, _) if is_transient_api_error(error) => {
-            Some(Duration::from_secs(15 << (attempt - 1)))
-        }
-        _ => None,
-    }
+    let kind = match error {
+        ChatError::RequestError(_) => RetryKind::Transport,
+        ChatError::ApiError(error, _) if is_transient_api_error(error) => RetryKind::Capacity,
+        _ => return None,
+    };
+    Some(kind.delay(attempt, None))
 }
 
 /// Errors that can occur when interacting with the ChatGPT API.

@@ -546,7 +546,7 @@ impl BatchClient {
                         GetBatchStatusError::RequestError(_)
                         | GetBatchStatusError::JsonParseError(..) => true,
                         GetBatchStatusError::OpenAiError(error) => {
-                            crate::chat_completions::is_transient_api_error(error)
+                            crate::retry::is_transient_api_error(error)
                         }
                     } =>
                 {
@@ -762,8 +762,7 @@ impl BatchClient {
         loop {
             match self.list_batches_limited(Some(PAGE), after).await {
                 Err(ListBatchesError::OpenAiError(error))
-                    if attempt < ATTEMPTS
-                        && crate::chat_completions::is_transient_api_error(&error) =>
+                    if attempt < ATTEMPTS && crate::retry::is_transient_api_error(&error) =>
                 {
                     let wait = Duration::from_secs(15 * u64::from(attempt));
                     warn!("listing batches: {error}; retrying in {wait:?}");
@@ -886,7 +885,7 @@ fn api_errors_parse_in_the_wrapped_shape_the_api_sends() {
     }"#;
     let error = parse_api_error(body).unwrap();
     assert_eq!(error.code.as_deref(), Some("rate_limit_exceeded"));
-    assert!(crate::chat_completions::is_transient_api_error(&error));
+    assert!(crate::retry::is_transient_api_error(&error));
     let bare = r#"{"type": "server_error", "message": "oops", "code": null, "param": null}"#;
     assert_eq!(parse_api_error(bare).unwrap().r#type, "server_error");
 }
