@@ -666,6 +666,9 @@ fn retry_delay(error: &ChatError, attempt: u32) -> Option<std::time::Duration> {
     let kind = match error {
         ChatError::RequestError(_) => RetryKind::Transport,
         ChatError::ApiError(error, _) if is_transient_api_error(error) => RetryKind::Capacity,
+        // A body that isn't JSON comes from a gateway in front of the API (a
+        // 502/504 page), never from the API judging the request.
+        ChatError::ApiDidNotReturnJson { .. } => RetryKind::Capacity,
         _ => return None,
     };
     Some(kind.delay(attempt, None))
@@ -1749,37 +1752,7 @@ impl ChatClient {
                 "Sending {} uncached request(s) live instead of batching",
                 misses.len()
             );
-            // Uses the *mapped* live call so this path caches on exactly the
-            // same condition as the batch path — a response that fails the
-            // caller's mapping is not written to the cache either way.
-            let mapped = |raw: String| map_response(raw).map_err(ChatError::ChatError);
-            let mapped = &mapped;
-            let results: Vec<(usize, Result<T, IndividualChatError>)> =
-                futures::stream::iter(misses)
-                    .map(|(index, request)| async move {
-                        let result = self
-                            .chat_with_messages_raw_mapped(
-                                request.messages.clone(),
-                                request.response_format.clone(),
-                                mapped,
-                            )
-                            .await;
-                        let result = match result {
-                            Ok(response) => Ok(response),
-                            // A live failure becomes this request's error rather
-                            // than failing the whole call, matching what the
-                            // batch path returns per item.
-                            Err(ChatError::ChatError(e)) => Err(e),
-                            Err(e) => Err(IndividualChatError::Other(e.to_string())),
-                        };
-                        (index, result)
-                    })
-                    .buffer_unordered(LIVE_CONCURRENCY)
-                    .collect()
-                    .await;
-            for (index, result) in results {
-                output[index] = Some(result);
-            }
+            self.send_live(misses, &mut output, map_response).await;
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
@@ -1788,21 +1761,77 @@ impl ChatClient {
         let batch = batch_client
             .wait_for_batch(&batch.id, &mut on_progress)
             .await?;
-        self.harvest_batch(
-            &batch_client,
-            &batch,
-            false,
-            &mut misses,
-            &mut output,
-            map_response,
-        )
-        .await?;
-        if let Some((_, request)) = misses.first() {
-            return Err(BatchChatError::CustomIdNotFound(Self::batch_custom_id(
-                request,
-            )));
+        let failures = self
+            .harvest_batch(
+                &batch_client,
+                &batch,
+                false,
+                &mut misses,
+                &mut output,
+                map_response,
+            )
+            .await?;
+        // Items the batch failed to run or never returned get one more chance
+        // live, where transient errors are retried with backoff.
+        if !misses.is_empty() && misses.len() <= self.small_batch_threshold {
+            warn!(
+                "batch {} left {} request(s) unanswered; sending them live",
+                batch.id,
+                misses.len()
+            );
+            self.send_live(misses, &mut output, map_response).await;
+            return Ok(output.into_iter().map(Option::unwrap).collect());
+        }
+        // Too many to resend live: report each failure in its slot, and save
+        // CustomIdNotFound for IDs the batch never mentioned.
+        for (index, request) in misses {
+            let id = Self::batch_custom_id(&request);
+            let Some(error) = failures.get(&id) else {
+                return Err(BatchChatError::CustomIdNotFound(id));
+            };
+            output[index] = Some(Err(IndividualChatError::Other(error.clone())));
         }
         Ok(output.into_iter().map(Option::unwrap).collect())
+    }
+
+    /// Answer `misses` with live calls, filling their slots in `output`.
+    async fn send_live<T>(
+        &self,
+        misses: Vec<(usize, ChatRequest)>,
+        output: &mut [Option<Result<T, IndividualChatError>>],
+        map_response: &impl Fn(String) -> Result<T, IndividualChatError>,
+    ) {
+        use futures::StreamExt as _;
+        // Uses the *mapped* live call so this path caches on exactly the same
+        // condition as the batch path — a response that fails the caller's
+        // mapping is not written to the cache either way.
+        let mapped = |raw: String| map_response(raw).map_err(ChatError::ChatError);
+        let mapped = &mapped;
+        let results: Vec<(usize, Result<T, IndividualChatError>)> = futures::stream::iter(misses)
+            .map(|(index, request)| async move {
+                let result = self
+                    .chat_with_messages_raw_mapped(
+                        request.messages.clone(),
+                        request.response_format.clone(),
+                        mapped,
+                    )
+                    .await;
+                let result = match result {
+                    Ok(response) => Ok(response),
+                    // A live failure becomes this request's error rather than
+                    // failing the whole call, matching what the batch path
+                    // returns per item.
+                    Err(ChatError::ChatError(e)) => Err(e),
+                    Err(e) => Err(IndividualChatError::Other(e.to_string())),
+                };
+                (index, result)
+            })
+            .buffer_unordered(LIVE_CONCURRENCY)
+            .collect()
+            .await;
+        for (index, result) in results {
+            output[index] = Some(result);
+        }
     }
 
     fn batch_request_hash(request: &ChatRequest) -> u64 {
@@ -1863,12 +1892,13 @@ impl ChatClient {
     }
 
     /// Fill `output` from a terminal batch's results and drop the filled
-    /// slots from `misses`. With `retry_failures`, a failed item (an API
-    /// error, a refusal, or a response the caller's mapping rejects) stays a
-    /// miss so it is asked again; otherwise it is reported in its slot. The
-    /// first suits a batch found from an earlier run — a failure is never
-    /// cached, so the same batch would otherwise replay it forever — and the
-    /// second the batch this call just ran.
+    /// slots from `misses`. An item the API failed to run always stays a miss.
+    /// With `retry_failures`, a model outcome we cannot use (a refusal, or a
+    /// response the caller's mapping rejects) also stays a miss so it is asked
+    /// again; otherwise it is reported in its slot. The first suits a batch
+    /// found from an earlier run — a failure is never cached, so the same
+    /// batch would otherwise replay it forever — and the second the batch this
+    /// call just ran. Returns the API's reason for each item it failed to run.
     async fn harvest_batch<T>(
         &self,
         client: &BatchClient,
@@ -1877,7 +1907,7 @@ impl ChatClient {
         misses: &mut Vec<(usize, ChatRequest)>,
         output: &mut [Option<Result<T, IndividualChatError>>],
         map_response: &impl Fn(String) -> Result<T, IndividualChatError>,
-    ) -> Result<(), BatchChatError> {
+    ) -> Result<HashMap<String, String>, BatchChatError> {
         let expected = misses
             .iter()
             .map(|(_, r)| Self::batch_custom_id(r))
@@ -1902,9 +1932,8 @@ impl ChatClient {
                 results = client.get_batch_results(batch).await?;
             }
         }
-        // Every item the file mentions is resolved here, one way or the other:
-        // a well-formed success, or the reason it is not. Only IDs the file
-        // never mentions stay misses to be asked again.
+        // Read every item the file mentions: a well-formed response, or the
+        // reason the API could not produce one.
         let mut responses: HashMap<String, Result<ChatResponse, String>> = HashMap::new();
         for item in results {
             if !expected.contains(&item.custom_id) {
@@ -1919,45 +1948,42 @@ impl ChatClient {
                     Err(error) => Err(format!("malformed response: {error}")),
                 },
             };
+            // Account once per billed response, not per duplicate prompt or
+            // download.
+            if let Ok(response) = &response {
+                *self.batch_usage.write().unwrap() += response.usage;
+                self.record_spend(None, response.usage, 0.5);
+            }
+            let response = response.and_then(|response| match response.choices.is_empty() {
+                true => Err("response had no choices".to_owned()),
+                false => Ok(response),
+            });
             if let Err(error) = &response {
                 warn!("batch {} item {}: {error}", batch.id, item.custom_id);
             }
             responses.insert(item.custom_id, response);
-        }
-        // Account once per billed response, not per duplicate prompt or download.
-        for response in responses.values().flatten() {
-            *self.batch_usage.write().unwrap() += response.usage;
-            self.record_spend(None, response.usage, 0.5);
         }
         let mut cached = HashSet::new();
         for (index, request) in misses.iter() {
             let id = Self::batch_custom_id(request);
             // Mapped per slot: T need not be Clone, and duplicate prompts must
             // not consume one another's response.
-            let value = match responses.get(&id) {
-                None => continue,
-                Some(Err(error)) => Err(IndividualChatError::Other(error.clone())),
-                Some(Ok(response)) => match response.choices.first() {
-                    None => Err(IndividualChatError::Other(
-                        "response had no choices".to_owned(),
-                    )),
-                    Some(choice) => {
-                        let value = choice
-                            .message
-                            .clone()
-                            .content()
-                            .map_err(IndividualChatError::Refusal)
-                            .and_then(map_response);
-                        // The cache write lives inside the `Ok` branch so a
-                        // refusal or a response that fails the caller's
-                        // mapping is never stored.
-                        if value.is_ok() && cached.insert(id) {
-                            self.cache_batch_response(request, response).await?;
-                        }
-                        value
-                    }
-                },
+            // An item the API failed to run says nothing about the request, so
+            // it stays a miss and is asked again, like a missing ID.
+            let Some(Ok(response)) = responses.get(&id) else {
+                continue;
             };
+            let value = response.choices[0]
+                .message
+                .clone()
+                .content()
+                .map_err(IndividualChatError::Refusal)
+                .and_then(map_response);
+            // The cache write lives inside the `Ok` branch so a refusal or a
+            // response that fails the caller's mapping is never stored.
+            if value.is_ok() && cached.insert(id) {
+                self.cache_batch_response(request, response).await?;
+            }
             if value.is_err() && retry_failures {
                 continue;
             }
@@ -1971,7 +1997,10 @@ impl ChatClient {
             batch.status
         );
         misses.retain(|(index, _)| output[*index].is_none());
-        Ok(())
+        Ok(responses
+            .into_iter()
+            .filter_map(|(id, response)| Some((id, response.err()?)))
+            .collect())
     }
 
     async fn chat_cached<T>(
@@ -3045,10 +3074,14 @@ mod retry_tests {
             .await
             .unwrap();
         assert_eq!(output[0].take().unwrap().unwrap(), "good");
-        // Every ID the file mentions is resolved: failures are per-item
-        // errors, not misses, and none of them is cached.
-        assert!(misses.is_empty());
-        for slot in &mut output[1..] {
+        // Items the API failed to run stay misses to be asked again; the
+        // model's refusal and the rejected mapping are reported per item.
+        // None of them is cached.
+        assert_eq!(
+            misses.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [1, 2, 5]
+        );
+        for slot in &mut output[3..5] {
             assert!(slot.take().unwrap().is_err());
         }
         assert_eq!(client.batch_usage().total_tokens, 45);
@@ -3125,9 +3158,9 @@ mod retry_tests {
             )
             .await
             .unwrap();
-        assert!(misses.is_empty());
+        assert_eq!(misses.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [1]);
         assert_eq!(output[0].take().unwrap().unwrap(), "good");
-        assert!(output[1].take().unwrap().is_err());
+        assert!(output[1].is_none());
         task.await.unwrap();
     }
 
@@ -3171,6 +3204,43 @@ mod retry_tests {
         assert!(!network[2].contains("alpha"));
         assert!(network[3].contains(&remaining_hash));
         assert_eq!(client.batch_usage().total_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn item_failures_beyond_the_live_threshold_are_reported_per_slot() {
+        let mut client = ChatClient::new("unused", "gpt-4o-mini");
+        let prompts = ["alpha", "beta"]
+            .map(|s| (vec![ChatMessage::user(s)], ResponseFormat::Text))
+            .to_vec();
+        let requests = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, (m, f))| (i, client.request_for_messages(m.clone(), f.clone())))
+            .collect::<Vec<_>>();
+        let batch = batch_json(
+            "completed",
+            Some("output"),
+            &ChatClient::batch_hash(&requests),
+        )
+        .to_string();
+        let lines = [
+            result_line(ChatClient::batch_custom_id(&requests[0].1), "good"),
+            serde_json::json!({"id":"item", "custom_id":ChatClient::batch_custom_id(&requests[1].1), "error":{"code":"failed", "message":"failed"}}).to_string(),
+        ].join("\n");
+        let (url, _task) = server(vec![
+            ("GET /v1/batches?limit=100 ", serde_json::json!({"object":"list", "data":[], "has_more":false}).to_string()),
+            ("POST /v1/files ", serde_json::json!({"id":"input", "object":"file", "bytes":1, "created_at":0, "filename":"batch", "purpose":"batch"}).to_string()),
+            ("POST /v1/batches ", batch.clone()),
+            ("GET /v1/batches/batch-test ", batch),
+            ("GET /v1/files/output/content ", lines),
+        ]).await;
+        client.base_url = url;
+        let results = client
+            .batch_chat_with_messages_raw(prompts, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(results[0].as_ref().unwrap(), "good");
+        assert!(matches!(&results[1], Err(IndividualChatError::Other(e)) if e.contains("failed")));
     }
 
     #[tokio::test]
