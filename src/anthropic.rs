@@ -811,7 +811,7 @@ impl ChatClient {
                             },
                         )
                         .await;
-                    (key.clone(), value)
+                    (key.clone(), value.map_err(std::sync::Arc::new))
                 })
                 .buffer_unordered(LIVE_CONCURRENCY)
                 .collect()
@@ -823,7 +823,7 @@ impl ChatClient {
                 }
                 output[*index] = Some(match &results[&self.cache_key(request)] {
                     Ok(raw) => map(raw.clone()),
-                    Err(error) => Err(IndividualChatError::Other(error.to_string())),
+                    Err(error) => Err(SharedChatError(error.clone()).into()),
                 });
             }
         }

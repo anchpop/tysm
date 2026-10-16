@@ -613,6 +613,31 @@ async fn cancellation_race_still_harvests_and_expired_results_forget_pending_ids
 }
 
 #[tokio::test]
+async fn live_batch_failure_preserves_source_for_duplicate_prompts() {
+    use std::error::Error;
+
+    let (url, task) = server(vec![(
+        "POST /v1/messages ",
+        400,
+        json!({"type":"error", "error":{"type":"invalid_request_error", "message":"Insufficient credits"}}).to_string(),
+    )])
+    .await;
+    let c = client().with_url(url).with_small_batch_threshold(1);
+    let results = c
+        .batch_chat::<Answer>(vec!["x", "x"], |_| panic!("must not batch"))
+        .await
+        .unwrap();
+    for result in results {
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.source().unwrap().downcast_ref::<ChatError>(),
+            Some(ChatError::HttpStatus { status: 400, .. })
+        ));
+    }
+    assert_eq!(task.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn small_batch_counts_unique_prompts_and_uses_live_cache() {
     let (url, task) = server(vec![(
         "POST /v1/messages ",

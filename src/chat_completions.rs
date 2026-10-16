@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use reqwest::Client;
@@ -796,6 +796,23 @@ pub enum BatchChatError {
     CacheIoError(#[from] std::io::Error),
 }
 
+/// A live request error shared by duplicate batch items.
+/// Its source is the original [`ChatError`], not the `Arc` holding it.
+#[derive(Debug, Clone)]
+pub struct SharedChatError(pub Arc<ChatError>);
+
+impl std::fmt::Display for SharedChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "The request failed: `{}`", self.0)
+    }
+}
+
+impl std::error::Error for SharedChatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 /// Errors that can occur when sending many chat requests via the batch API.
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -818,12 +835,12 @@ pub enum IndividualChatError {
     #[error("The API refused to fulfill the request: `{0}`")]
     Refusal(String),
 
-    /// The request failed outright.
-    ///
-    /// Only produced when a batch's requests are sent live (see the
-    /// small-batch threshold or `with_no_batch`): a transport or API failure belongs
-    /// to that one request, and reporting it per-item keeps the live path's
-    /// result shape identical to the batch path's.
+    /// A live request failed. The source preserves the transport or API error,
+    /// shared when duplicate batch items use the same live response.
+    #[error(transparent)]
+    RequestFailed(#[from] SharedChatError),
+
+    /// A batch item failed without a structured error.
     #[error("The request failed: `{0}`")]
     Other(String),
 
@@ -1822,7 +1839,7 @@ impl ChatClient {
                     // failing the whole call, matching what the batch path
                     // returns per item.
                     Err(ChatError::ChatError(e)) => Err(e),
-                    Err(e) => Err(IndividualChatError::Other(e.to_string())),
+                    Err(e) => Err(SharedChatError(Arc::new(e)).into()),
                 };
                 (index, result)
             })
@@ -2813,6 +2830,51 @@ mod retry_tests {
             requests
         });
         (url, task)
+    }
+
+    #[tokio::test]
+    async fn live_batch_fallback_preserves_api_error_source() {
+        use std::error::Error;
+
+        let (url, task) = server(vec![
+            (
+                "GET /v1/batches?limit=100 ",
+                serde_json::json!({"object":"list", "data":[], "has_more":false}).to_string(),
+            ),
+            (
+                "POST /v1/chat/completions ",
+                serde_json::json!({"error": {
+                    "message": "No credits remaining",
+                    "type": "billing_error",
+                    "code": "credit_balance_exhausted"
+                }})
+                .to_string(),
+            ),
+        ])
+        .await;
+        let mut client = ChatClient::new("unused", "gpt-4o-mini").with_no_batch();
+        client.base_url = url;
+        let error = client
+            .batch_chat_with_messages_raw(
+                vec![(vec![ChatMessage::user("hello")], ResponseFormat::Text)],
+                |_| {},
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap_err();
+        let mut source: &(dyn Error + 'static) = &error;
+        loop {
+            if let Some(ChatError::ApiError(api, _)) = source.downcast_ref::<ChatError>() {
+                assert_eq!(api.code.as_deref(), Some("credit_balance_exhausted"));
+                break;
+            }
+            source = source
+                .source()
+                .expect("structured API error in source chain");
+        }
+        task.await.unwrap();
     }
 
     fn batch_json(status: &str, output: Option<&str>, hash: &str) -> serde_json::Value {
