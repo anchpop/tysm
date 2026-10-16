@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
@@ -2190,14 +2191,57 @@ impl ChatClient {
         let mut spend = self.spend.write().unwrap();
         match crate::model_prices::cost_of_call(&self.model, service_tier, usage) {
             Some(dollars) => {
+                PROCESS_SPEND_MICRO_USD.fetch_add(
+                    (dollars * discount * 1_000_000.0).round() as u64,
+                    Ordering::Relaxed,
+                );
                 if let Some(total) = spend.as_mut() {
                     *total += dollars * discount;
                 }
             }
             // One unpriced request makes the total unknowable, and it stays
             // that way — a later priced request must not resurrect it.
-            None => *spend = None,
+            None => {
+                PROCESS_UNPRICED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                *spend = None;
+            }
         }
+    }
+}
+
+static PROCESS_SPEND_MICRO_USD: AtomicU64 = AtomicU64::new(0);
+static PROCESS_UNPRICED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// What every [`ChatClient`] in this process has spent so far, live and
+/// harvested Batch API responses alike.
+///
+/// A program usually builds many clients, so their per-client
+/// [`cost`](ChatClient::cost)s don't add up to a run total on their own.
+/// Batch items the API ran but this process never harvested (a batch left
+/// behind by a killed run) are billed without appearing here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcessSpend {
+    /// Dollars spent on requests whose model has a known price.
+    pub dollars: f64,
+    /// Requests to models with no known price, which `dollars` leaves out.
+    pub unpriced_requests: u64,
+}
+
+impl std::fmt::Display for ProcessSpend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "${:.2}", self.dollars)?;
+        if self.unpriced_requests > 0 {
+            write!(f, " + {} unpriced request(s)", self.unpriced_requests)?;
+        }
+        Ok(())
+    }
+}
+
+/// See [`ProcessSpend`].
+pub fn process_spend() -> ProcessSpend {
+    ProcessSpend {
+        dollars: PROCESS_SPEND_MICRO_USD.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        unpriced_requests: PROCESS_UNPRICED_REQUESTS.load(Ordering::Relaxed),
     }
 }
 
@@ -2250,6 +2294,32 @@ fn cost_includes_batch_usage_at_half_price() {
 
     // The same usage again via the Batch API should cost exactly half as much more.
     assert!((with_batch - live_only * 1.5).abs() < 1e-9);
+}
+
+#[test]
+fn process_spend_sums_every_client() {
+    let usage = ChatUsage {
+        prompt_tokens: 1_000_000,
+        completion_tokens: 0,
+        total_tokens: 1_000_000,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
+    };
+    let before = process_spend();
+    for client in [
+        ChatClient::new("sk-test", "gpt-4o"),
+        ChatClient::new("sk-test", "gpt-4o"),
+        ChatClient::new("sk-test", "not-a-real-model"),
+    ] {
+        client.record_spend(None, usage, 1.0);
+    }
+    let after = process_spend();
+
+    // Other tests record spend concurrently, so only a lower bound holds.
+    let one = ChatClient::new("sk-test", "gpt-4o");
+    one.record_spend(None, usage, 1.0);
+    assert!(after.dollars - before.dollars >= 2.0 * one.cost().unwrap() - 1e-6);
+    assert!(after.unpriced_requests > before.unpriced_requests);
 }
 
 #[test]
