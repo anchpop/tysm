@@ -7,7 +7,7 @@
 
 use super::*;
 use futures::{StreamExt, TryStreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 /// The native API used for chat and batch requests.

@@ -508,17 +508,30 @@ impl EmbeddingsClient {
             .await?;
 
         #[derive(Deserialize)]
-        struct Billing { usage: Usage }
+        struct Billing {
+            usage: Usage,
+        }
         if let Ok(billing) = serde_json::from_str::<Billing>(&response) {
-            crate::spend::record("openai", &self.model, None, crate::spend::SpendKind::Live,
+            crate::spend::record(
+                "openai",
+                &self.model,
+                None,
+                crate::spend::SpendKind::Live,
                 crate::chat_completions::ChatUsage {
                     prompt_tokens: billing.usage.prompt_tokens,
                     total_tokens: billing.usage.total_tokens,
                     ..Default::default()
-                });
+                },
+            );
         } else if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&response) {
             if let Some(usage) = raw.get("usage") {
-                crate::spend::unparsed("openai", &self.model, None, crate::spend::SpendKind::Live, usage.clone());
+                crate::spend::unparsed(
+                    "openai",
+                    &self.model,
+                    None,
+                    crate::spend::SpendKind::Live,
+                    usage.clone(),
+                );
             }
         }
         Ok(response)

@@ -476,17 +476,34 @@ pub fn cost_of_call_split(
     tokens: CallTokens,
 ) -> Option<(f64, f64)> {
     let model_cost = price_of(model)?;
-    if u64::from(tokens.cached_prompt) + u64::from(tokens.cache_creation_5m)
-        + u64::from(tokens.cache_creation_1h) > u64::from(tokens.prompt) {
+    if u64::from(tokens.cached_prompt)
+        + u64::from(tokens.cache_creation_5m)
+        + u64::from(tokens.cache_creation_1h)
+        > u64::from(tokens.prompt)
+    {
         return None;
     }
     if (tokens.cache_creation_5m > 0 || tokens.cache_creation_1h > 0)
-        && !model.starts_with("claude-") && !model.starts_with("gpt-6-luna") {
+        && !model.starts_with("claude-")
+        && !model.starts_with("gpt-6-luna")
+    {
         // Native Anthropic premiums and the supplied Luna rate card are known;
         // other models' cache-write premiums have not been confirmed.
         return None;
     }
-    if !matches!(service_tier, None | Some("batch" | "default" | "standard" | "auto" | "standard_only" | "flex" | "priority" | "fast")) {
+    if !matches!(
+        service_tier,
+        None | Some(
+            "batch"
+                | "default"
+                | "standard"
+                | "auto"
+                | "standard_only"
+                | "flex"
+                | "priority"
+                | "fast"
+        )
+    ) {
         return None;
     }
 
@@ -556,11 +573,17 @@ mod tests {
     fn cache_writes_are_a_prompt_subset_and_unknown_premiums_stay_unknown() {
         let mut tokens = usage(1000, 0, 0);
         tokens.cache_creation_5m = 1000;
-        assert_eq!(cost_of_call("gpt-6-luna", Some("batch"), tokens), Some(0.0000625));
+        assert_eq!(
+            cost_of_call("gpt-6-luna", Some("batch"), tokens),
+            Some(0.0000625)
+        );
         assert_eq!(cost_of_call("gpt-5.6-terra", Some("batch"), tokens), None);
         tokens.cached_prompt = 1;
         assert_eq!(cost_of_call("gpt-6-luna", Some("batch"), tokens), None);
-        assert_eq!(cost_of_call("gpt-6-luna", Some("unknown-tier"), usage(100,0,0)), None);
+        assert_eq!(
+            cost_of_call("gpt-6-luna", Some("unknown-tier"), usage(100, 0, 0)),
+            None
+        );
     }
 
     #[test]
