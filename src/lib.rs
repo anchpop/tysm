@@ -51,6 +51,8 @@ pub mod decisions;
 pub mod embeddings;
 pub mod files;
 pub mod model_prices;
+pub mod measurement;
+pub mod spend;
 mod retry;
 mod schema;
 mod utils;

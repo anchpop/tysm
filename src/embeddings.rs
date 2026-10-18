@@ -108,6 +108,9 @@ pub struct EmbeddingsClient {
 /// Errors that can occur when interacting with the ChatGPT API.
 #[derive(Error, Debug)]
 pub enum EmbeddingsError {
+    /// Measurement never submits an uncached embedding request.
+    #[error("embedding cache miss in measurement mode")]
+    CacheMiss,
     /// An error occurred when sending the request to the API.
     #[error("Request error: {0}")]
     RequestError(#[from] reqwest::Error),
@@ -488,6 +491,9 @@ impl EmbeddingsClient {
         &self,
         request: &EmbeddingsRequest<'_>,
     ) -> Result<String, EmbeddingsError> {
+        if crate::measurement::enabled() {
+            return Err(EmbeddingsError::CacheMiss);
+        }
         let _permit = self.semaphore.acquire().await.unwrap();
 
         let response = self
@@ -501,6 +507,20 @@ impl EmbeddingsClient {
             .text()
             .await?;
 
+        #[derive(Deserialize)]
+        struct Billing { usage: Usage }
+        if let Ok(billing) = serde_json::from_str::<Billing>(&response) {
+            crate::spend::record("openai", &self.model, None, crate::spend::SpendKind::Live,
+                crate::chat_completions::ChatUsage {
+                    prompt_tokens: billing.usage.prompt_tokens,
+                    total_tokens: billing.usage.total_tokens,
+                    ..Default::default()
+                });
+        } else if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&response) {
+            if let Some(usage) = raw.get("usage") {
+                crate::spend::unparsed("openai", &self.model, None, crate::spend::SpendKind::Live, usage.clone());
+            }
+        }
         Ok(response)
     }
 

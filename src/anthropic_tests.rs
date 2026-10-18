@@ -153,10 +153,12 @@ fn request_uses_native_schema_system_thinking_and_all_extra_parameters() {
     assert_eq!(schema["additionalProperties"], false);
     assert!(schema.get("$schema").is_none());
     assert!(schema["properties"]["value"].get("minimum").is_none());
-    assert!(schema["properties"]["value"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("minimum"));
+    assert!(
+        schema["properties"]["value"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("minimum")
+    );
     assert_eq!(body["cache_control"]["ttl"], "1h");
     assert_eq!(body["max_tokens"], 500);
     assert_eq!(body["stop_sequences"], json!(["STOP"]));
@@ -178,9 +180,11 @@ fn schema_transform_visits_schemas_not_property_names() {
     assert_eq!(value["properties"]["minimum"]["type"], "integer");
     assert!(value["properties"]["minimum"].get("minimum").is_none());
     assert!(value["properties"]["items"].get("minItems").is_none());
-    assert!(value["properties"]["items"]["items"]
-        .get("minLength")
-        .is_none());
+    assert!(
+        value["properties"]["items"]["items"]
+            .get("minLength")
+            .is_none()
+    );
     assert_eq!(value["properties"]["nested"]["additionalProperties"], false);
 }
 
@@ -207,18 +211,22 @@ fn nested_optional_schemas_preserve_references_and_reject_maps() {
     let body = request_body(&req).unwrap();
     let schema = &body["output_config"]["format"]["schema"];
     assert!(schema["$defs"]["Answer"].is_object());
-    assert!(schema["properties"]["values"]["items"]
-        .get("$ref")
-        .is_some());
+    assert!(
+        schema["properties"]["values"]["items"]
+            .get("$ref")
+            .is_some()
+    );
     assert!(schema["properties"]["other"].get("anyOf").is_some());
     assert_eq!(schema["$defs"]["Answer"]["additionalProperties"], false);
     req.response_format = ResponseFormat::JsonSchema {
         json_schema: c.json_schema_format::<HashMap<String, u32>>(),
     };
-    assert!(request_body(&req)
-        .unwrap_err()
-        .to_string()
-        .contains("arbitrary keys"));
+    assert!(
+        request_body(&req)
+            .unwrap_err()
+            .to_string()
+            .contains("arbitrary keys")
+    );
 }
 
 #[test]
@@ -305,9 +313,11 @@ fn cache_keys_include_provider_and_every_input() {
     }
     assert_eq!(changed.iter().collect::<HashSet<_>>().len(), changed.len());
     assert!(custom_id(&key).len() <= 64);
-    assert!(custom_id(&key)
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    assert!(
+        custom_id(&key)
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    );
 }
 
 #[test]
@@ -516,9 +526,11 @@ async fn batch_deduplicates_maps_errors_caches_success_and_recovers_failures() {
     let requests = task.await.unwrap();
     let body: Value = serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
     assert_eq!(body["requests"].as_array().unwrap().len(), 4);
-    assert!(body["requests"][0]["params"]
-        .get("reasoning_effort")
-        .is_none());
+    assert!(
+        body["requests"][0]["params"]
+            .get("reasoning_effort")
+            .is_none()
+    );
     let cached = client().with_cache_directory(dir.path()).with_cached_only();
     let answer: Answer = cached
         .chat_with_system_prompt("Return a value.", "good")
@@ -603,11 +615,13 @@ async fn cancellation_race_still_harvests_and_expired_results_forget_pending_ids
         .batch_chat_with_system_prompt::<Answer>("Return a value.", vec!["x"], |_| {})
         .await
         .unwrap();
-    assert!(results[0]
-        .as_ref()
-        .unwrap_err()
-        .to_string()
-        .contains("rerun"));
+    assert!(
+        results[0]
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("rerun")
+    );
     assert!(c.pending_batch(&request(&c, "x")).await.is_none());
     task.await.unwrap();
 }

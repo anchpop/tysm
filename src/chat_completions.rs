@@ -4,27 +4,55 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use reqwest::Client;
-use schemars::{schema_for, transform::Transform, JsonSchema, Schema};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use schemars::{JsonSchema, Schema, schema_for, transform::Transform};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use xxhash_rust::const_xxh3::xxh3_64 as const_xxh3;
 
+use crate::OpenAiError;
 use crate::batch::{Batch, BatchClient, BatchRequestItem, BatchStatus};
-use crate::retry::{is_transient_api_error, RetryKind, LIVE_REQUEST_ATTEMPTS};
+use crate::retry::{LIVE_REQUEST_ATTEMPTS, RetryKind, is_transient_api_error};
 use crate::schema::OpenAiTransform;
 use crate::utils::ApiKeyError;
-use crate::OpenAiError;
 use log::{debug, info, warn};
 
 #[path = "anthropic.rs"]
 mod anthropic;
 pub use anthropic::Provider;
+
+fn batch_ranges(
+    sizes: impl IntoIterator<Item = usize>,
+    max_requests: usize,
+    max_bytes: usize,
+) -> Result<Vec<std::ops::Range<usize>>, BatchChatError> {
+    let mut ranges = Vec::new();
+    let (mut start, mut end, mut bytes) = (0, 0, 0);
+    for (index, size) in sizes.into_iter().enumerate() {
+        if size > max_bytes {
+            return Err(BatchChatError::RequestTooLarge {
+                index,
+                bytes: size,
+                limit: max_bytes,
+            });
+        }
+        if index - start == max_requests || bytes + size > max_bytes {
+            ranges.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+        bytes += size;
+        end = index + 1;
+    }
+    if start < end {
+        ranges.push(start..end);
+    }
+    Ok(ranges)
+}
 
 /// To use this library, you need to create a [`ChatClient`]. This contains various information needed to interact with the ChatGPT API,
 /// such as the API key, the model to use, and the URL of the API.
@@ -282,7 +310,7 @@ impl InputAudio {
 
 /// A request to the ChatGPT API. You probably will not need to use this directly,
 /// but it is public because it is still exposed in errors.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatRequest {
     /// The model to use for the ChatGPT API.
     pub model: String,
@@ -445,7 +473,7 @@ impl schemars::transform::Transform for LegacyOpenAiTransform {
 
 /// An object specifying the format that the model must output.
 /// `ResponseFormat::JsonSchema` enables Structured Outputs which ensures the model will match your supplied JSON schema
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ResponseFormat {
     /// The model is constrained to return a JSON object of the specified schema.
@@ -466,7 +494,7 @@ pub enum ResponseFormat {
 }
 
 /// The format of a JSON schema.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JsonSchemaFormat {
     /// The name of the schema. It's not clear whether this is actually used anywhere by OpenAI.
     pub name: String,
@@ -505,7 +533,7 @@ impl JsonSchemaFormat {
 /// A JSON schema format wrapper.
 /// The `additionalProperties` constraint is handled by [`OpenAiTransform`](crate::schema::OpenAiTransform)
 /// which adds it only to object-type schemas.
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SchemaFormat {
     /// The schema.
     #[serde(flatten)]
@@ -592,7 +620,8 @@ pub struct PromptTokenDetails {
     /// OpenAI automatically caches tokens that are used in a previous request.
     /// This reduces input cost.
     pub cached_tokens: u32,
-    /// Anthropic input tokens written to its five-minute prompt cache.
+    /// Five-minute cache-write tokens (Anthropic or OpenAI-compatible usage).
+    #[serde(alias = "cache_write_tokens")]
     pub cache_creation_5m_tokens: u32,
     /// Anthropic input tokens written to its one-hour prompt cache.
     pub cache_creation_1h_tokens: u32,
@@ -707,7 +736,9 @@ pub enum ChatError {
     },
 
     /// The API returned a response could not be parsed into the structure expected of OpenAI responses
-    #[error("API returned a response could not be parsed into the structure expected of OpenAI responses: `{response:#}` (request: `{request}`)")]
+    #[error(
+        "API returned a response could not be parsed into the structure expected of OpenAI responses: `{response:#}` (request: `{request}`)"
+    )]
     ApiParseError {
         /// The response from the API.
         response: serde_json::Value,
@@ -770,6 +801,17 @@ pub enum BatchChatError {
     #[error("Chat completions error for request with custom id `{1}`")]
     OpenAiError(#[source] OpenAiError, String),
 
+    /// A single request cannot fit in a provider-sized batch file.
+    #[error("Batch request {index} is {bytes} bytes, exceeding the {limit}-byte file budget")]
+    RequestTooLarge {
+        /// Position in the stage's input.
+        index: usize,
+        /// Complete serialized JSONL line size.
+        bytes: usize,
+        /// Maximum batch file size.
+        limit: usize,
+    },
+
     /// A custom ID in the batch request was not found in the results.
     #[error("Custom ID `{0}` not found in results")]
     CustomIdNotFound(String),
@@ -779,7 +821,9 @@ pub enum BatchChatError {
     BatchNoChoices(String),
 
     /// The API returned a response could not be parsed into the structure expected of OpenAI responses
-    #[error("API returned a response could not be parsed into the structure expected of OpenAI responses: {response}")]
+    #[error(
+        "API returned a response could not be parsed into the structure expected of OpenAI responses: {response}"
+    )]
     ApiParseError {
         /// The error that occurred when parsing the response.
         #[source]
@@ -893,8 +937,11 @@ impl ChatClient {
         }
     }
 
-    /// How few uncached requests a batch may contain before it is sent as
-    /// ordinary live calls instead. Zero (the default) always batches.
+    /// Maximum uncached requests in a whole batch call to send as ordinary
+    /// live calls instead. Zero (the default) always batches. Pass an entire
+    /// stage in one call: OpenAI file sizing (40,000 requests / 180 MB) and
+    /// concurrent submission are handled internally, without applying this
+    /// threshold independently to each file.
     pub fn with_small_batch_threshold(mut self, threshold: usize) -> Self {
         self.small_batch_threshold = threshold;
         self
@@ -1294,7 +1341,13 @@ impl ChatClient {
             .await
         {
             match cached_response {
-                Ok((result, _usage)) => {
+                Ok((result, usage)) => {
+                    crate::measurement::observe(
+                        &chat_request,
+                        &self.cache_key(&chat_request),
+                        Some((&self.model, usage)),
+                        "live",
+                    );
                     debug!("Using cached response from current model {}", self.model);
                     return Ok(result);
                 }
@@ -1321,7 +1374,13 @@ impl ChatClient {
                 .await
             {
                 match cached_response {
-                    Ok((result, _usage)) => {
+                    Ok((result, usage)) => {
+                        crate::measurement::observe(
+                            &chat_request,
+                            &self.cache_key(&chat_request),
+                            Some((&fallback.model, usage)),
+                            "live",
+                        );
                         debug!(
                             "Using cached response from fallback model {}",
                             fallback.model
@@ -1338,10 +1397,16 @@ impl ChatClient {
             }
         }
 
-        if self.cached_only {
+        if self.cached_only || crate::measurement::enabled() {
+            crate::measurement::observe(
+                &chat_request,
+                &self.cache_key(&chat_request),
+                None,
+                "live",
+            );
             return Err(ChatError::CacheMiss);
         }
-        let (chat_response, result, usage) = {
+        let (chat_response, result, _usage) = {
             let mut attempt = 1;
             loop {
                 let outcome = match self.chat_uncached(&chat_request).await {
@@ -1371,10 +1436,8 @@ impl ChatClient {
                 }
             }
         };
-        if self.provider == Provider::OpenAi {
-            *self.usage.write().unwrap() += usage;
-            self.record_spend(self.service_tier.as_deref(), usage, 1.0);
-        }
+        // Billing is recorded at the transport boundary, before validation:
+        // refusals and malformed structured outputs still consume paid tokens.
 
         // cache the response
         {
@@ -1546,7 +1609,7 @@ impl ChatClient {
     async fn cached_batch_content(
         &self,
         request: &ChatRequest,
-    ) -> Option<Result<String, IndividualChatError>> {
+    ) -> Option<(String, ChatUsage, Result<String, IndividualChatError>)> {
         let clients = std::iter::once(self)
             .chain(self.cache_fallbacks.iter())
             .collect::<Vec<_>>();
@@ -1574,17 +1637,23 @@ impl ChatClient {
             match response {
                 ChatResponseOrError::Response(response) => {
                     if response.object == "message" {
-                        return Some(anthropic::response_content(&response));
+                        return Some((
+                            client.model.clone(),
+                            response.usage,
+                            anthropic::response_content(&response),
+                        ));
                     }
                     let Some(choice) = response.choices.into_iter().next() else {
                         continue;
                     };
-                    return Some(
+                    return Some((
+                        client.model.clone(),
+                        response.usage,
                         choice
                             .message
                             .content()
                             .map_err(IndividualChatError::Refusal),
-                    );
+                    ));
                 }
                 ChatResponseOrError::Error(_) => continue,
             }
@@ -1640,6 +1709,9 @@ impl ChatClient {
     ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
         info!("Starting batch chat with {} prompts", prompts.len());
 
+        // Keep the historical pre-cache boundaries: existing uploaded jobs are
+        // identified by the set of misses within each of these ranges.
+        let ranges = self.batch_ranges(&prompts)?;
         let mut output = (0..prompts.len()).map(|_| None).collect::<Vec<_>>();
         let mut misses = Vec::new();
         // Cache lookups run concurrently: each one walks this client's cache and
@@ -1662,7 +1734,7 @@ impl ChatClient {
                 let cached = self
                     .cached_batch_content(&request)
                     .await
-                    .map(|cached| cached.and_then(map_response));
+                    .map(|(model, usage, cached)| (model, usage, cached.and_then(map_response)));
                 (index, request, cached)
             })
             .buffer_unordered(CACHE_LOOKUP_CONCURRENCY);
@@ -1670,8 +1742,18 @@ impl ChatClient {
         // is dropped as soon as it is known to be one.
         while let Some((index, request, cached)) = lookups.next().await {
             match cached {
-                Some(Ok(value)) => output[index] = Some(Ok(value)),
-                Some(Err(_)) | None => misses.push((index, request)),
+                Some((model, usage, Ok(value))) => {
+                    crate::measurement::observe(
+                        &request,
+                        &self.cache_key(&request),
+                        Some((&model, usage)),
+                        "cache",
+                    );
+                    output[index] = Some(Ok(value));
+                }
+                Some((_, _, Err(_))) | None => {
+                    misses.push((index, request));
+                }
             }
         }
         misses.sort_by_key(|(index, _)| *index);
@@ -1679,7 +1761,15 @@ impl ChatClient {
         if misses.is_empty() {
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
-        if self.cached_only {
+        if self.cached_only || crate::measurement::enabled() {
+            let transport = if misses.len() <= self.small_batch_threshold {
+                "live_if_no_existing_batch"
+            } else {
+                "batch"
+            };
+            for (_, request) in &misses {
+                crate::measurement::observe(request, &self.cache_key(request), None, transport);
+            }
             // Cached-only is a per-request condition, as on the live path: the
             // hits are still answers, and callers already handle per-item
             // errors, so a miss is reported in its slot rather than failing
@@ -1701,6 +1791,65 @@ impl ChatClient {
                 .await;
         }
 
+        // Freeze the transport decision for a split stage, never each file.
+        // A single file is the whole stage, so its existing small-tail recovery
+        // can still use the threshold after harvesting completed responses.
+        let threshold = if ranges.len() == 1 || misses.len() <= self.small_batch_threshold {
+            self.small_batch_threshold
+        } else {
+            0
+        };
+        let progress = std::sync::Mutex::new(&mut on_progress);
+        let mut pending = misses.into_iter().peekable();
+        let jobs = ranges
+            .into_iter()
+            .map(|range| {
+                let mut indices = Vec::new();
+                let mut requests = Vec::new();
+                while pending.peek().is_some_and(|(index, _)| *index < range.end) {
+                    let (index, request) = pending.next().unwrap();
+                    indices.push(index);
+                    requests.push((requests.len(), request));
+                }
+                (indices, requests)
+            })
+            .collect::<Vec<_>>();
+        let results = futures::future::join_all(jobs.into_iter().map(|(indices, requests)| {
+            let progress = &progress;
+            async move {
+                let result = self
+                    .run_batch_job(
+                        requests,
+                        threshold,
+                        |batch| (*progress.lock().unwrap())(batch),
+                        map_response,
+                    )
+                    .await;
+                (indices, result)
+            }
+        }))
+        .await;
+        // Settle all jobs before propagating errors; successful jobs cache their
+        // answers even when a sibling encounters a queue limit.
+        for (indices, result) in results {
+            for (index, value) in indices.into_iter().zip(result?) {
+                output[index] = Some(value);
+            }
+        }
+        Ok(output.into_iter().map(Option::unwrap).collect())
+    }
+
+    async fn run_batch_job<T>(
+        &self,
+        mut misses: Vec<(usize, ChatRequest)>,
+        threshold: usize,
+        mut on_progress: impl FnMut(&Batch),
+        map_response: &impl Fn(String) -> Result<T, IndividualChatError>,
+    ) -> Result<Vec<Result<T, IndividualChatError>>, BatchChatError> {
+        let mut output = (0..misses.len()).map(|_| None).collect::<Vec<_>>();
+        if misses.is_empty() {
+            return Ok(Vec::new());
+        }
         // Send the uncached requests live instead of batching when there are
         // too few to be worth a batch's fixed overhead (or always, under
         // `with_no_batch`). Decided on what is still unanswered, not the
@@ -1711,7 +1860,19 @@ impl ChatClient {
             Ok(existing) => existing,
             // Live mode must work against an endpoint that has no Batch API at
             // all; there is nothing to harvest there.
-            Err(error) if misses.len() <= self.small_batch_threshold => {
+            Err(BatchChatError::ListBatchesError(
+                crate::batch::ListBatchesError::RequestError(ref error),
+            )) if self.small_batch_threshold == usize::MAX
+                && matches!(error.status().map(|s| s.as_u16()), Some(404 | 405)) =>
+            {
+                None
+            }
+            Err(error)
+                if self.small_batch_threshold == usize::MAX
+                    && matches!(&error,
+                BatchChatError::ListBatchesError(crate::batch::ListBatchesError::OpenAiError(e))
+                    if !crate::retry::is_transient_api_error(e)) =>
+            {
                 warn!("could not look for an existing batch, sending live: {error}");
                 None
             }
@@ -1725,9 +1886,7 @@ impl ChatClient {
                 let outstanding = misses
                     .len()
                     .saturating_sub(batch.request_counts.completed as usize);
-                if outstanding <= self.small_batch_threshold
-                    && batch.status != BatchStatus::Cancelling
-                {
+                if outstanding <= threshold && batch.status != BatchStatus::Cancelling {
                     warn!(
                         "sending live: cancelling in-flight batch {} for these requests \
                          and harvesting its completed results",
@@ -1758,14 +1917,30 @@ impl ChatClient {
                 )
                 .await
             {
-                warn!("could not harvest batch {}: {error}", batch.id);
+                let expired = matches!(&error,
+                    BatchChatError::GetBatchResultsError(crate::batch::GetBatchResultsError::DownloadFileError(
+                        crate::files::FilesError::RequestError(e)))
+                        if e.status() == Some(reqwest::StatusCode::NOT_FOUND));
+                let unreadable = matches!(
+                    &error,
+                    BatchChatError::GetBatchResultsError(
+                        crate::batch::GetBatchResultsError::JsonParseError(..)
+                    )
+                );
+                if !expired && !unreadable {
+                    return Err(error);
+                }
+                warn!(
+                    "could not harvest expired results for batch {}: {error}",
+                    batch.id
+                );
             }
         }
         if misses.is_empty() {
             return Ok(output.into_iter().map(Option::unwrap).collect());
         }
 
-        if misses.len() <= self.small_batch_threshold {
+        if misses.len() <= threshold {
             info!(
                 "Sending {} uncached request(s) live instead of batching",
                 misses.len()
@@ -1791,7 +1966,7 @@ impl ChatClient {
             .await?;
         // Items the batch failed to run or never returned get one more chance
         // live, where transient errors are retried with backoff.
-        if !misses.is_empty() && misses.len() <= self.small_batch_threshold {
+        if !misses.is_empty() && misses.len() <= threshold {
             warn!(
                 "batch {} left {} request(s) unanswered; sending them live",
                 batch.id,
@@ -1852,6 +2027,25 @@ impl ChatClient {
         }
     }
 
+    // These budgets and pre-cache boundaries match Yap's former partitioner.
+    // Moving the scheduling here must not orphan already-uploaded batches.
+    fn batch_ranges(
+        &self,
+        prompts: &[(Vec<ChatMessage>, ResponseFormat)],
+    ) -> Result<Vec<std::ops::Range<usize>>, BatchChatError> {
+        let client = BatchClient::from(self);
+        let sizes = prompts.iter().map(|(messages, format)| {
+            let request = self.request_for_messages(messages.clone(), format.clone());
+            client
+                .create_batch_content(&[BatchRequestItem::new_chat(
+                    Self::batch_custom_id(&request),
+                    request,
+                )])
+                .len()
+        });
+        batch_ranges(sizes, 40_000, 180_000_000)
+    }
+
     fn batch_request_hash(request: &ChatRequest) -> u64 {
         const_xxh3(serde_json::to_string(request).unwrap().as_bytes())
     }
@@ -1909,6 +2103,58 @@ impl ChatClient {
             .await?)
     }
 
+    /// Cache usable answers from an explicitly named completed OpenAI batch.
+    /// Uses the normal typed-response decoder and harvest/cache-write path.
+    /// Only downloads results: never submits, cancels, waits for, or retries a job.
+    /// Returns the number of supplied requests with usable answers.
+    pub async fn harvest_completed_batch<T: DeserializeOwned>(
+        &self,
+        batch: &Batch,
+        requests: Vec<ChatRequest>,
+    ) -> Result<usize, BatchChatError> {
+        assert_eq!(self.provider, Provider::OpenAi);
+        assert_eq!(batch.status, BatchStatus::Completed);
+        if requests.is_empty() {
+            return Ok(0);
+        }
+        for request in &requests {
+            assert_eq!(
+                serde_json::to_string(request).unwrap(),
+                serde_json::to_string(&self.request_for_messages(
+                    request.messages.clone(),
+                    request.response_format.clone()
+                ))
+                .unwrap(),
+                "harvest client must match the submitted request settings"
+            );
+        }
+        let ResponseFormat::JsonSchema { json_schema } = &requests[0].response_format else {
+            panic!("typed harvesting requires a JSON schema");
+        };
+        let schema = serde_json::to_string(&json_schema.schema).unwrap();
+        let count = requests.len();
+        let mut misses = requests.into_iter().enumerate().collect::<Vec<_>>();
+        let mut output = (0..count).map(|_| None).collect::<Vec<_>>();
+        self.harvest_batch(
+            &BatchClient::from(self),
+            batch,
+            true,
+            &mut misses,
+            &mut output,
+            &|raw| {
+                Self::decode_json::<T>(&raw).map_err(|error| {
+                    IndividualChatError::ResponseNotConformantToSchema {
+                        error,
+                        response: raw.trim().to_string(),
+                        schema: schema.clone(),
+                    }
+                })
+            },
+        )
+        .await?;
+        Ok(count - misses.len())
+    }
+
     /// Fill `output` from a terminal batch's results and drop the filled
     /// slots from `misses`. An item the API failed to run always stays a miss.
     /// With `retry_failures`, a model outcome we cannot use (a refusal, or a
@@ -1957,6 +2203,26 @@ impl ChatClient {
             if !expected.contains(&item.custom_id) {
                 continue;
             }
+            if let Some(raw_usage) = item
+                .response
+                .as_ref()
+                .and_then(|response| response.body.get("usage"))
+            {
+                match serde_json::from_value::<ChatUsage>(raw_usage.clone()) {
+                    Ok(usage) => self.record_batch_spend(&batch.id, &item.custom_id, usage),
+                    Err(_) if self.first_batch_observation(&batch.id, &item.custom_id) => {
+                        crate::spend::unparsed(
+                            "openai",
+                            &self.model,
+                            None,
+                            crate::spend::SpendKind::BatchHarvest,
+                            raw_usage.clone(),
+                        );
+                        *self.spend.write().unwrap() = None;
+                    }
+                    Err(_) => {}
+                }
+            }
             let response = match (item.error, item.response) {
                 (Some(error), _) => Err(error.to_string()),
                 (None, None) => Err("batch item had neither response nor error".to_owned()),
@@ -1966,12 +2232,6 @@ impl ChatClient {
                     Err(error) => Err(format!("malformed response: {error}")),
                 },
             };
-            // Account once per billed response, not per duplicate prompt or
-            // download.
-            if let Ok(response) = &response {
-                *self.batch_usage.write().unwrap() += response.usage;
-                self.record_spend(None, response.usage, 0.5);
-            }
             let response = response.and_then(|response| match response.choices.is_empty() {
                 true => Err("response had no choices".to_owned()),
                 false => Ok(response),
@@ -2134,7 +2394,40 @@ impl ChatClient {
             .text()
             .await?;
 
+        self.record_live_response(&response);
         Ok(response)
+    }
+
+    fn record_live_response(&self, response: &str) {
+        // Decode only the billing envelope: choices/content can be invalid while
+        // usage is perfectly valid and billable. Prefer the actual response tier.
+        #[derive(Deserialize)]
+        struct Billing {
+            usage: ChatUsage,
+            service_tier: Option<String>,
+        }
+        if let Ok(billing) = serde_json::from_str::<Billing>(response) {
+            self.record_spend(
+                billing
+                    .service_tier
+                    .as_deref()
+                    .or(self.service_tier.as_deref()),
+                billing.usage,
+                1.0,
+            );
+            *self.usage.write().unwrap() += billing.usage;
+        } else if let Ok(raw) = serde_json::from_str::<serde_json::Value>(response) {
+            if let Some(usage) = raw.get("usage") {
+                crate::spend::unparsed(
+                    "openai",
+                    &self.model,
+                    self.service_tier.as_deref(),
+                    crate::spend::SpendKind::Live,
+                    usage.clone(),
+                );
+                *self.spend.write().unwrap() = None;
+            }
+        }
     }
 
     fn decode_json<T: DeserializeOwned>(json: &str) -> Result<T, serde_json::Error> {
@@ -2181,6 +2474,24 @@ impl ChatClient {
         *self.spend.read().unwrap()
     }
 
+    fn first_batch_observation(&self, batch: &str, custom_id: &str) -> bool {
+        static OBSERVED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+            std::sync::OnceLock::new();
+        let key = format!("{:?}/{}/{batch}/{custom_id}", self.provider, self.base_url);
+        OBSERVED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(key)
+    }
+
+    fn record_batch_spend(&self, batch: &str, custom_id: &str, usage: ChatUsage) {
+        if self.first_batch_observation(batch, custom_id) {
+            self.record_spend(None, usage, 0.5);
+            *self.batch_usage.write().unwrap() += usage;
+        }
+    }
+
     /// Price one request and add it to the running total, `discount` scaling
     /// the result (the Batch API bills at half).
     ///
@@ -2189,28 +2500,29 @@ impl ChatClient {
     /// one prompt was, which the totals no longer remember.
     fn record_spend(&self, service_tier: Option<&str>, usage: ChatUsage, discount: f64) {
         let mut spend = self.spend.write().unwrap();
-        match crate::model_prices::cost_of_call(&self.model, service_tier, usage) {
+        let kind = if discount == 0.5 {
+            crate::spend::SpendKind::BatchHarvest
+        } else {
+            crate::spend::SpendKind::Live
+        };
+        let provider = match self.provider {
+            Provider::OpenAi => "openai",
+            Provider::Anthropic => "anthropic",
+        };
+        match crate::spend::record(provider, &self.model, service_tier, kind, usage) {
             Some(dollars) => {
-                PROCESS_SPEND_MICRO_USD.fetch_add(
-                    (dollars * discount * 1_000_000.0).round() as u64,
-                    Ordering::Relaxed,
-                );
                 if let Some(total) = spend.as_mut() {
-                    *total += dollars * discount;
+                    *total += dollars;
                 }
             }
             // One unpriced request makes the total unknowable, and it stays
             // that way — a later priced request must not resurrect it.
             None => {
-                PROCESS_UNPRICED_REQUESTS.fetch_add(1, Ordering::Relaxed);
                 *spend = None;
             }
         }
     }
 }
-
-static PROCESS_SPEND_MICRO_USD: AtomicU64 = AtomicU64::new(0);
-static PROCESS_UNPRICED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 /// What every [`ChatClient`] in this process has spent so far, live and
 /// harvested Batch API responses alike.
@@ -2239,10 +2551,49 @@ impl std::fmt::Display for ProcessSpend {
 
 /// See [`ProcessSpend`].
 pub fn process_spend() -> ProcessSpend {
-    ProcessSpend {
-        dollars: PROCESS_SPEND_MICRO_USD.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-        unpriced_requests: PROCESS_UNPRICED_REQUESTS.load(Ordering::Relaxed),
-    }
+    crate::spend::totals()
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn billing_precedes_overflow_of_legacy_client_usage() {
+    let client = ChatClient::new("unused", "gpt-4o");
+    client.usage.write().unwrap().prompt_tokens = u32::MAX;
+    let usage = ChatUsage {
+        prompt_tokens: 1,
+        total_tokens: 1,
+        ..Default::default()
+    };
+    let response = serde_json::json!({"usage":usage}).to_string();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.record_live_response(&response)
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(
+        client.cost(),
+        crate::spend::price("gpt-4o", None, crate::spend::SpendKind::Live, usage)
+    );
+}
+
+#[test]
+fn billing_envelope_counts_invalid_choices_and_actual_tier() {
+    let client = ChatClient::new("unused", "gpt-6-luna").with_service_tier("flex");
+    client.record_live_response(r#"{"choices":"invalid","service_tier":"default","usage":{"prompt_tokens":1000000,"completion_tokens":1000000,"total_tokens":2000000}}"#);
+    assert!((client.cost().unwrap() - 0.95).abs() < 1e-9);
+    assert_eq!(client.usage().prompt_tokens, 1_000_000);
+}
+
+#[test]
+fn repeated_batch_harvest_is_not_counted_twice() {
+    let client = ChatClient::new("unused", "gpt-4o");
+    let usage = ChatUsage {
+        prompt_tokens: 1000,
+        ..Default::default()
+    };
+    client.record_batch_spend("dedup-test-batch", "item", usage);
+    client.record_batch_spend("dedup-test-batch", "item", usage);
+    assert_eq!(client.batch_usage().prompt_tokens, 1000);
+    assert_eq!(client.cost(), Some(0.00125));
 }
 
 #[test]
@@ -2900,6 +3251,214 @@ mod retry_tests {
             requests
         });
         (url, task)
+    }
+
+    #[test]
+    fn provider_file_boundaries_match_the_former_caller_partitioner() {
+        assert!(batch_ranges([], 40_000, 180_000_000).unwrap().is_empty());
+        assert_eq!(
+            batch_ranges([60, 40, 1], 40_000, 100).unwrap(),
+            [0..2, 2..3]
+        );
+        assert_eq!(batch_ranges([1, 1, 1], 2, 100).unwrap(), [0..2, 2..3]);
+        assert_eq!(
+            batch_ranges(vec![1; 40_001], 40_000, 180_000_000).unwrap(),
+            [0..40_000, 40_000..40_001]
+        );
+        assert!(matches!(
+            batch_ranges([101], 40_000, 100),
+            Err(BatchChatError::RequestTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_harvest_only_gets_and_caches_typed_successes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut client =
+            ChatClient::new("unused", "gpt-4o-mini").with_cache_directory(directory.path());
+        let requests = ["valid", "invalid", "quota"].map(|text| {
+            client.request_for_messages(
+                vec![ChatMessage::user(text)],
+                ResponseFormat::JsonSchema {
+                    json_schema: JsonSchemaFormat::new::<u32>(),
+                },
+            )
+        });
+        let encoded = serde_json::to_vec(&requests).unwrap();
+        let decoded: Vec<ChatRequest> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+        let body = [
+            result_line(ChatClient::batch_custom_id(&requests[0]), "7"),
+            result_line(ChatClient::batch_custom_id(&requests[1]), "not JSON"),
+            serde_json::json!({"id":"failed-item", "custom_id":ChatClient::batch_custom_id(&requests[2]),
+                "error":{"code":"insufficient_quota","message":"no credits"}}).to_string(),
+        ].join("\n");
+        let (url, task) = server(vec![("GET /v1/files/output/content ", body)]).await;
+        client.base_url = url;
+        let batch =
+            serde_json::from_value(batch_json("completed", Some("output"), "ignored")).unwrap();
+        assert_eq!(
+            client
+                .harvest_completed_batch::<u32>(&batch, decoded)
+                .await
+                .unwrap(),
+            1
+        );
+        task.await.unwrap();
+        let reader =
+            ChatClient::new("unused", "gpt-4o-mini").with_cache_directory(directory.path());
+        assert_eq!(
+            reader
+                .cached_batch_content(&requests[0])
+                .await
+                .unwrap()
+                .2
+                .unwrap(),
+            "7"
+        );
+        assert!(reader.cached_batch_content(&requests[1]).await.is_none());
+        assert!(reader.cached_batch_content(&requests[2]).await.is_none());
+    }
+
+    #[test]
+    fn request_lines_match_the_former_yap_partitioner() {
+        let client = ChatClient::new("unused", "gpt-4o-mini").with_service_tier("flex");
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("日本語\n\"quoted\""),
+        ];
+        let format = ResponseFormat::JsonSchema {
+            json_schema: JsonSchemaFormat::new::<String>(),
+        };
+        // This is the exact field mapping formerly maintained in batch_jobs.
+        let former = ChatRequest {
+            model: client.model.clone(),
+            messages: messages.clone(),
+            response_format: format.clone(),
+            service_tier: client.service_tier.clone(),
+            prompt_cache_key: client.prompt_cache_key.clone(),
+            reasoning_effort: client.reasoning_effort.clone(),
+            extra_body: client.extra_body.clone(),
+        };
+        let actual = client.request_for_messages(messages, format);
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&former).unwrap()
+        );
+        assert_eq!(client.cache_key(&actual), client.cache_key(&former));
+        let old_id = format!(
+            "request-{}",
+            const_xxh3(serde_json::to_string(&former).unwrap().as_bytes())
+        );
+        let batch = BatchClient::from(&client);
+        let old_line = batch.create_batch_content(&[BatchRequestItem::new_chat(old_id, former)]);
+        let new_line = batch.create_batch_content(&[BatchRequestItem::new_chat(
+            ChatClient::batch_custom_id(&actual),
+            actual,
+        )]);
+        assert_eq!(old_line, new_line);
+        assert_eq!(new_line.last(), Some(&b'\n'));
+        let value: serde_json::Value = serde_json::from_slice(&new_line).unwrap();
+        assert!(value["body"]["response_format"]["json_schema"].is_object());
+        assert_eq!(
+            value["body"]["messages"][1]["content"][0]["text"],
+            "日本語\n\"quoted\""
+        );
+        assert_eq!(
+            serde_json::to_vec(&value).unwrap().len() + 1,
+            new_line.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_threshold_and_existing_hashes_survive_provider_partitioning() {
+        let mut client = ChatClient::new("unused", "gpt-4o-mini").with_small_batch_threshold(3);
+        let prompt = |text: &str| (vec![ChatMessage::user(text)], ResponseFormat::Text);
+        let cached = client.request_for_messages(prompt("cached").0, ResponseFormat::Text);
+        // Three misses in the first file and one in the second; neither file
+        // exceeds the threshold, but the stage does. Warm hits must still
+        // occupy their historical positions when computing request_hash.
+        let mut prompts = vec![prompt("cached"); 40_001];
+        for (index, text) in [(0, "alpha"), (1, "beta"), (2, "gamma"), (40_000, "delta")] {
+            prompts[index] = prompt(text);
+        }
+        let requests = [0, 1, 2, 40_000].map(|index| {
+            (
+                index,
+                client.request_for_messages(prompts[index].0.clone(), ResponseFormat::Text),
+            )
+        });
+        let mut first = batch_json("in_progress", None, &ChatClient::batch_hash(&requests[..3]));
+        let mut second = batch_json("in_progress", None, &ChatClient::batch_hash(&requests[3..]));
+        first["request_counts"]["completed"] = 0.into();
+        second["request_counts"]["completed"] = 0.into();
+        let listing = serde_json::json!({"object":"list", "data":[first,second], "has_more":false})
+            .to_string();
+        let completed = batch_json("completed", Some("output"), "unused").to_string();
+        let results = requests
+            .iter()
+            .map(|(_, request)| result_line(ChatClient::batch_custom_id(request), "batch"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The same result file can serve both jobs; harvesting ignores IDs
+        // outside its own request set. Any cancellation or live POST fails.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        client.base_url = format!("http://{}/v1/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut counts = [0; 3];
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|s| s == b"\r\n\r\n") {
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let (index, body) = if request.starts_with("GET /v1/batches?limit=100 ") {
+                    (0, &listing)
+                } else if request.starts_with("GET /v1/batches/batch-test ") {
+                    (1, &completed)
+                } else {
+                    assert!(
+                        request.starts_with("GET /v1/files/output/content "),
+                        "unexpected request: {request}"
+                    );
+                    (2, &results)
+                };
+                counts[index] += 1;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            counts
+        });
+        client
+            .cache_batch_response(
+                &cached,
+                &serde_json::from_value(response_json("cached")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let output = client
+            .batch_chat_with_messages_raw(prompts, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(output.len(), 40_001);
+        for (index, value) in output.into_iter().enumerate() {
+            assert_eq!(
+                value.unwrap(),
+                if [0, 1, 2, 40_000].contains(&index) {
+                    "batch"
+                } else {
+                    "cached"
+                }
+            );
+        }
+        assert_eq!(task.await.unwrap(), [2, 2, 2]);
+        assert_eq!(client.usage().total_tokens, 0);
     }
 
     #[tokio::test]

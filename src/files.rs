@@ -295,15 +295,7 @@ impl FilesClient {
     /// # });
     /// ```
     pub async fn list_files(&self) -> Result<FileList, FilesError> {
-        let response = self
-            .http_client
-            .get(self.files_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
-
-        let file_list = response.json::<FileList>().await?;
-        Ok(file_list)
+        self.get_json(self.files_url()).await
     }
 
     /// Retrieve a file from the OpenAI API.
@@ -318,15 +310,24 @@ impl FilesClient {
     /// # });
     /// ```
     pub async fn retrieve_file(&self, file_id: &str) -> Result<FileObject, FilesError> {
-        let response = self
-            .http_client
-            .get(self.files_url().join(file_id).unwrap())
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
+        self.get_json(self.files_url().join(file_id).unwrap()).await
+    }
 
-        let file_object = response.json::<FileObject>().await?;
-        Ok(file_object)
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: url::Url,
+    ) -> Result<T, FilesError> {
+        let response = crate::retry::get_text(
+            self.http_client
+                .get(url.clone())
+                .header("Authorization", format!("Bearer {}", self.api_key)),
+        )
+        .await?;
+        serde_json::from_str(&response).map_err(|error| FilesError::ApiParseError {
+            url: url.to_string(),
+            response,
+            error,
+        })
     }
 
     /// Delete a file from the OpenAI API.
@@ -368,15 +369,12 @@ impl FilesClient {
             .files_url()
             .join(&format!("{file_id}/content"))
             .unwrap();
-        let response = self
-            .http_client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .send()
-            .await?;
-
-        let content = response.text().await?;
-        Ok(content)
+        Ok(crate::retry::get_text(
+            self.http_client
+                .get(url)
+                .header("Authorization", format!("Bearer {}", self.api_key)),
+        )
+        .await?)
     }
 }
 
