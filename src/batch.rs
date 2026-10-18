@@ -501,15 +501,13 @@ impl BatchClient {
     /// Get the status of a batch.
     pub async fn get_batch_status(&self, batch_id: &str) -> Result<Batch, GetBatchStatusError> {
         let url = self.batches_url().join(batch_id).unwrap();
-        let response = self
-            .http_client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .send()
-            .await?;
-
-        let response_text = response.text().await?;
+        let response_text = crate::retry::get_text(
+            self.http_client
+                .get(url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json"),
+        )
+        .await?;
         let batch: Result<Batch, serde_json::Error> = serde_json::from_str(&response_text);
 
         match batch {
@@ -543,8 +541,10 @@ impl BatchClient {
                 }
                 Err(e)
                     if match &e {
-                        GetBatchStatusError::RequestError(_)
-                        | GetBatchStatusError::JsonParseError(..) => true,
+                        GetBatchStatusError::RequestError(error) => {
+                            crate::retry::transient_http_error(error)
+                        }
+                        GetBatchStatusError::JsonParseError(..) => true,
                         GetBatchStatusError::OpenAiError(error) => {
                             crate::retry::is_transient_api_error(error)
                         }
@@ -648,7 +648,7 @@ impl BatchClient {
             .into_iter()
             .flatten()
         {
-            let content = self.download_batch_file(batch, file_id).await?;
+            let content = self.files_client.download_file(file_id).await?;
             debug!("Got results for batch {}: {}", batch.id, content);
             for line in content.lines() {
                 let result: BatchResponseItem = serde_json::from_str(line)
@@ -658,33 +658,6 @@ impl BatchClient {
         }
 
         Ok(results)
-    }
-
-    /// Available results may represent hours of completed work, so a
-    /// transient transport failure gets a few retries rather than bubbling up
-    /// and discarding the wait.
-    async fn download_batch_file(
-        &self,
-        batch: &Batch,
-        file_id: &str,
-    ) -> Result<String, GetBatchResultsError> {
-        let mut attempt = 0;
-        loop {
-            match self.files_client.download_file(file_id).await {
-                Ok(content) => return Ok(content),
-                Err(FilesError::RequestError(e)) if attempt < 5 => {
-                    attempt += 1;
-                    let delay = 10 * attempt;
-                    warn!(
-                        "transient error downloading results for batch {}, \
-                         retrying in {delay} seconds: {e}",
-                        batch.id
-                    );
-                    sleep(Duration::from_secs(delay)).await;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
     }
 
     /// Cancel a batch.
@@ -757,14 +730,22 @@ impl BatchClient {
     /// minute; a rate limit is only the wrong moment, so it is waited out.
     async fn list_batch_page(&self, after: Option<&str>) -> Result<BatchList, ListBatchesError> {
         const PAGE: u32 = 100;
-        const ATTEMPTS: u32 = 10;
+        const ATTEMPTS: u32 = crate::retry::LIVE_REQUEST_ATTEMPTS;
         let mut attempt = 1;
         loop {
             match self.list_batches_limited(Some(PAGE), after).await {
-                Err(ListBatchesError::OpenAiError(error))
-                    if attempt < ATTEMPTS && crate::retry::is_transient_api_error(&error) =>
+                Err(error)
+                    if attempt < ATTEMPTS
+                        && match &error {
+                            ListBatchesError::OpenAiError(error) => {
+                                crate::retry::is_transient_api_error(error)
+                            }
+                            ListBatchesError::JsonParseError(..) => true,
+                            // HTTP/transport errors were already retried by get_text.
+                            ListBatchesError::RequestError(_) => false,
+                        } =>
                 {
-                    let wait = Duration::from_secs(15 * u64::from(attempt));
+                    let wait = crate::retry::RetryKind::Capacity.delay(attempt, None);
                     warn!("listing batches: {error}; retrying in {wait:?}");
                     sleep(wait).await;
                     attempt += 1;
@@ -794,15 +775,13 @@ impl BatchClient {
             url.set_query(Some(&query_params.join("&")));
         }
 
-        let response = self
-            .http_client
-            .get(remove_trailing_slash(url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .send()
-            .await?;
-
-        let response_text = response.text().await?;
+        let response_text = crate::retry::get_text(
+            self.http_client
+                .get(remove_trailing_slash(url))
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .header("Content-Type", "application/json"),
+        )
+        .await?;
         let batch_list: Result<BatchList, serde_json::Error> = serde_json::from_str(&response_text);
 
         match batch_list {

@@ -50,9 +50,11 @@ pub mod chat_completions;
 pub mod decisions;
 pub mod embeddings;
 pub mod files;
+pub mod measurement;
 pub mod model_prices;
 mod retry;
 mod schema;
+pub mod spend;
 mod utils;
 
 pub use utils::ApiKeyError;

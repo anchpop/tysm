@@ -150,7 +150,7 @@ pub(super) fn request_body(request: &ChatRequest) -> Result<Value, ChatError> {
                 ChatMessageContent::InputAudio { .. } => {
                     return Err(invalid(
                         "Anthropic Messages does not accept OpenAI input_audio",
-                    ))
+                    ));
                 }
             });
         }
@@ -183,21 +183,27 @@ pub(super) fn request_body(request: &ChatRequest) -> Result<Value, ChatError> {
         ResponseFormat::JsonObject => {
             return Err(invalid(
                 "Anthropic requires a JSON schema; use typed chat or ResponseFormat::JsonSchema",
-            ))
+            ));
         }
     }
     if let Some(effort) = &request.reasoning_effort {
         let effort = match effort.as_str() {
             "minimal" => "low",
             "low" | "medium" | "high" | "xhigh" | "max" => effort,
-            _ => return Err(invalid("Anthropic effort must be minimal, low, medium, high, xhigh, or max; thinking cannot be disabled on current models")),
+            _ => {
+                return Err(invalid(
+                    "Anthropic effort must be minimal, low, medium, high, xhigh, or max; thinking cannot be disabled on current models",
+                ));
+            }
         };
         body["thinking"] = json!({"type":"adaptive"});
         body["output_config"]["effort"] = json!(effort);
     }
     if let Some(tier) = &request.service_tier {
         if !matches!(tier.as_str(), "auto" | "standard_only") {
-            return Err(invalid("Anthropic service_tier must be auto or standard_only (OpenAI flex is not supported)"));
+            return Err(invalid(
+                "Anthropic service_tier must be auto or standard_only (OpenAI flex is not supported)",
+            ));
         }
         body["service_tier"] = json!(tier);
     }
@@ -551,14 +557,35 @@ impl ChatClient {
 
     pub(super) async fn anthropic_chat(&self, request: &ChatRequest) -> Result<String, ChatError> {
         let body = request_body(request)?;
-        let message: Message = self
+        let raw: Value = self
             .anthropic_json(reqwest::Method::POST, "messages", Some(&body))
             .await?;
+        let tier = raw
+            .get("service_tier")
+            .or_else(|| raw["usage"].get("service_tier"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let tier = tier.as_deref().or(request.service_tier.as_deref());
+        match serde_json::from_value::<Usage>(raw["usage"].clone()) {
+            Ok(usage) => {
+                let usage = usage.into();
+                self.record_spend(tier, usage, 1.0);
+                *self.usage.write().unwrap() += usage;
+            }
+            Err(_) => {
+                crate::spend::unparsed(
+                    "anthropic",
+                    &self.model,
+                    tier,
+                    crate::spend::SpendKind::Live,
+                    raw["usage"].clone(),
+                );
+                *self.spend.write().unwrap() = None;
+            }
+        }
+        let message: Message =
+            serde_json::from_value(raw).map_err(|error| invalid(error.to_string()))?;
         let response = normalize(message);
-        // Bill refusals, truncations and nonconformant outputs too. They cost
-        // tokens even though the common validation layer will not cache them.
-        *self.usage.write().unwrap() += response.usage;
-        self.record_spend(request.service_tier.as_deref(), response.usage, 1.0);
         Ok(serde_json::to_string(&response).unwrap())
     }
 
@@ -675,7 +702,28 @@ impl ChatClient {
             if line.trim().is_empty() {
                 continue;
             }
-            let item: ResultLine = serde_json::from_str(&line)
+            let raw: Value = serde_json::from_str(&line)
+                .map_err(|e| invalid(format!("Malformed Anthropic batch result: {e}")))?;
+            if let (Some(id), Some(usage)) = (
+                raw["custom_id"].as_str(),
+                raw["result"]["message"].get("usage"),
+            ) {
+                match serde_json::from_value::<Usage>(usage.clone()) {
+                    Ok(usage) => self.record_batch_spend(&batch.id, id, usage.into()),
+                    Err(_) if self.first_batch_observation(&batch.id, id) => {
+                        crate::spend::unparsed(
+                            "anthropic",
+                            &self.model,
+                            None,
+                            crate::spend::SpendKind::BatchHarvest,
+                            usage.clone(),
+                        );
+                        *self.spend.write().unwrap() = None;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let item: ResultLine = serde_json::from_value(raw)
                 .map_err(|e| invalid(format!("Malformed Anthropic batch result: {e}")))?;
             if results
                 .insert(item.custom_id, item.result.response())
@@ -765,8 +813,7 @@ impl ChatClient {
                     Err(format!("Batch {id} omitted custom_id {}", custom_id(&key)))
                 });
                 if let Ok(response) = &result {
-                    *self.batch_usage.write().unwrap() += response.usage;
-                    self.record_spend(None, response.usage, 0.5);
+                    self.record_batch_spend(&id, &custom_id(&key), response.usage);
                 }
                 responses.insert(key, result);
             }
