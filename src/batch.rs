@@ -233,6 +233,47 @@ pub struct BatchItemError {
     pub message: String,
 }
 
+/// Gemini's OpenAI-compatible endpoint sends a batch's integers as JSON
+/// strings, as protobuf's JSON mapping does for 64-bit integers.
+mod lenient_number {
+    use serde::{de::Error, Deserialize, Deserializer};
+    use std::{fmt::Display, str::FromStr};
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumberOrString<T> {
+        Number(T),
+        String(String),
+    }
+
+    impl<T: FromStr<Err: Display>> NumberOrString<T> {
+        fn number<E: Error>(self) -> Result<T, E> {
+            match self {
+                Self::Number(number) => Ok(number),
+                Self::String(string) => string.parse().map_err(E::custom),
+            }
+        }
+    }
+
+    pub fn required<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de> + FromStr<Err: Display>,
+    {
+        NumberOrString::deserialize(deserializer)?.number()
+    }
+
+    pub fn optional<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de> + FromStr<Err: Display>,
+    {
+        Option::<NumberOrString<T>>::deserialize(deserializer)?
+            .map(NumberOrString::number)
+            .transpose()
+    }
+}
+
 /// A batch object.
 #[derive(Deserialize, Debug, Clone)]
 pub struct Batch {
@@ -244,7 +285,8 @@ pub struct Batch {
     pub endpoint: String,
     /// Any errors that occurred during batch creation.
     pub errors: Option<Value>,
-    /// The ID of the input file.
+    /// The ID of the input file. Gemini's listing leaves it out.
+    #[serde(default)]
     pub input_file_id: String,
     /// The completion window for this batch.
     pub completion_window: String,
@@ -255,16 +297,22 @@ pub struct Batch {
     /// The ID of the error file, if available.
     pub error_file_id: Option<String>,
     /// When the batch was created.
+    #[serde(deserialize_with = "lenient_number::required")]
     pub created_at: u64,
     /// When the batch started processing.
+    #[serde(default, deserialize_with = "lenient_number::optional")]
     pub in_progress_at: Option<u64>,
     /// When the batch expires.
+    #[serde(default, deserialize_with = "lenient_number::optional")]
     pub expires_at: Option<u64>,
     /// When the batch completed.
+    #[serde(default, deserialize_with = "lenient_number::optional")]
     pub completed_at: Option<u64>,
     /// When the batch failed.
+    #[serde(default, deserialize_with = "lenient_number::optional")]
     pub failed_at: Option<u64>,
     /// When the batch expired.
+    #[serde(default, deserialize_with = "lenient_number::optional")]
     pub expired_at: Option<u64>,
     /// The number of requests in the batch.
     pub request_counts: BatchRequestCounts,
@@ -320,10 +368,13 @@ impl std::fmt::Display for BatchStatus {
 #[derive(Deserialize, Debug, Clone)]
 pub struct BatchRequestCounts {
     /// The total number of requests in the batch.
+    #[serde(deserialize_with = "lenient_number::required")]
     pub total: u32,
     /// The number of completed requests in the batch.
+    #[serde(deserialize_with = "lenient_number::required")]
     pub completed: u32,
     /// The number of failed requests in the batch.
+    #[serde(deserialize_with = "lenient_number::required")]
     pub failed: u32,
 }
 
@@ -867,4 +918,48 @@ fn api_errors_parse_in_the_wrapped_shape_the_api_sends() {
     assert!(crate::retry::is_transient_api_error(&error));
     let bare = r#"{"type": "server_error", "message": "oops", "code": null, "param": null}"#;
     assert_eq!(parse_api_error(bare).unwrap().r#type, "server_error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_geminis_batch_list() {
+        // Verbatim from Gemini's OpenAI-compatible endpoint, 2026-10.
+        let list: BatchList = serde_json::from_str(
+            r#"{
+  "object": "list",
+  "data": [
+    {
+      "id": "batches/obywlii2ab1z54c10nq3gx84kh0z7zp4kzdz",
+      "object": "batch",
+      "endpoint": "/v1/chat/completions",
+      "completion_window": "24h",
+      "status": "completed",
+      "created_at": "1791158453",
+      "completed_at": "1791158633",
+      "request_counts": {
+        "total": "5",
+        "completed": "0",
+        "failed": "0"
+      },
+      "metadata": {
+        "display_name": "reliability-native-schema-pilot"
+      }
+    }
+  ],
+  "first_id": "batches/obywlii2ab1z54c10nq3gx84kh0z7zp4kzdz",
+  "last_id": "batches/obywlii2ab1z54c10nq3gx84kh0z7zp4kzdz",
+  "has_more": true
+}"#,
+        )
+        .unwrap();
+        let batch = &list.data[0];
+        assert_eq!(batch.created_at, 1791158453);
+        assert_eq!(batch.completed_at, Some(1791158633));
+        assert_eq!(batch.in_progress_at, None);
+        assert_eq!(batch.request_counts.total, 5);
+        assert_eq!(batch.input_file_id, "");
+    }
 }
