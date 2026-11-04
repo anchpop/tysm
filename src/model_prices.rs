@@ -96,6 +96,40 @@ mod tests {
     }
 
     #[test]
+    fn terra_cache_writes_from_reported_and_normalized_usage() {
+        for details in [
+            r#"{"cached_tokens":0,"cache_creation_5m_tokens":1375,"cache_creation_1h_tokens":0}"#,
+            r#"{"cached_tokens":0,"cache_write_tokens":1375}"#,
+        ] {
+            let usage: ChatUsage = serde_json::from_str(&format!(
+                r#"{{"prompt_tokens":1378,"completion_tokens":115,"total_tokens":1493,"prompt_tokens_details":{details}}}"#
+            )).unwrap();
+            // (3 ordinary * $2 + 1375 short writes * $2.50 + 115 output * $12)
+            // / 1M = $0.0048235.
+            let cost = cost_of_call("gpt-5.6-terra", Some("default"), usage).unwrap();
+            assert!((cost - 0.0048235).abs() < 1e-12);
+        }
+
+        let usage: ChatUsage = serde_json::from_str(
+            r#"{
+            "prompt_tokens":12000,"completion_tokens":0,"total_tokens":12000,
+            "prompt_tokens_details":{"cached_tokens":4000,"cache_write_tokens":7000,
+                "cache_write_tokens_details":{"ttl_30m_tokens":3000,"ttl_12h_tokens":4000}}
+        }"#,
+        )
+        .unwrap();
+        let tokens = tokens_of(usage);
+        assert_eq!(tokens.cache_creation_5m, 3000);
+        assert_eq!(tokens.cache_creation_1h, 4000);
+        // (1000 * $2 + 4000 * $0.20 + 3000 * $2.50 + 4000 * $5) / 1M.
+        let cost = cost_of_call("gpt-5.6-terra", None, usage).unwrap();
+        assert!((cost - 0.0303).abs() < 1e-12);
+        let round_trip: ChatUsage =
+            serde_json::from_value(serde_json::to_value(usage).unwrap()).unwrap();
+        assert_eq!(round_trip, usage);
+    }
+
+    #[test]
     fn a_request_with_no_cache_details_bills_every_prompt_token_uncached() {
         let usage = ChatUsage {
             prompt_tokens: 1_000_000,
