@@ -611,20 +611,51 @@ pub struct ChatUsage {
     pub completion_tokens_details: Option<CompletionTokenDetails>,
 }
 
-/// Includes details about the prompt tokens.
-/// Currently, only contains the number of cached tokens.
-// Defaulted field by field: some OpenAI-compatible providers send only a subset.
-#[derive(Deserialize, Debug, Default, Clone, Copy, Eq, PartialEq, Serialize)]
-#[serde(default)]
+/// Prompt cache reads and writes, with provider TTLs normalized into two buckets.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize)]
 pub struct PromptTokenDetails {
-    /// OpenAI automatically caches tokens that are used in a previous request.
-    /// This reduces input cost.
+    /// Prompt tokens served from cache.
     pub cached_tokens: u32,
-    /// Five-minute cache-write tokens (Anthropic or OpenAI-compatible usage).
-    #[serde(alias = "cache_write_tokens")]
+    /// Short-lived writes: Anthropic 5m or OpenAI 30m.
     pub cache_creation_5m_tokens: u32,
-    /// Anthropic input tokens written to its one-hour prompt cache.
+    /// Long-lived writes: Anthropic 1h or OpenAI 12h.
     pub cache_creation_1h_tokens: u32,
+}
+
+impl<'de> Deserialize<'de> for PromptTokenDetails {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Preserve the serialized normalized fields. OpenAI's total write count
+        // is the short-lived fallback only when no TTL breakdown is supplied.
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Details {
+            cached_tokens: u32,
+            #[serde(alias = "cache_write_tokens")]
+            cache_creation_5m_tokens: u32,
+            cache_creation_1h_tokens: u32,
+            cache_write_tokens_details: Option<WriteDetails>,
+        }
+        // Both fields are returned, including zeros:
+        // https://developers.openai.com/api/docs/guides/prompt-caching
+        #[derive(Deserialize)]
+        struct WriteDetails {
+            ttl_30m_tokens: u32,
+            ttl_12h_tokens: u32,
+        }
+        let details = Details::deserialize(deserializer)?;
+        let (short, long) = match details.cache_write_tokens_details {
+            Some(writes) => (writes.ttl_30m_tokens, writes.ttl_12h_tokens),
+            None => (
+                details.cache_creation_5m_tokens,
+                details.cache_creation_1h_tokens,
+            ),
+        };
+        Ok(Self {
+            cached_tokens: details.cached_tokens,
+            cache_creation_5m_tokens: short,
+            cache_creation_1h_tokens: long,
+        })
+    }
 }
 
 /// Includes details about the completion tokens for reasoning models

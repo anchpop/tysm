@@ -27,9 +27,9 @@ pub struct CallTokens {
     /// Prompt tokens the vendor served from cache — a subset of `prompt`,
     /// billed at the cheaper cached rate.
     pub cached_prompt: u32,
-    /// Prompt tokens written to Anthropic's five-minute cache (included in `prompt`).
+    /// Short-lived cache writes (Anthropic 5m / OpenAI 30m), included in `prompt`.
     pub cache_creation_5m: u32,
-    /// Prompt tokens written to Anthropic's one-hour cache (included in `prompt`).
+    /// Long-lived cache writes (Anthropic 1h / OpenAI 12h), included in `prompt`.
     pub cache_creation_1h: u32,
     /// Generated tokens, reasoning included. Vendors that report reasoning
     /// separately from completion must add the two before setting this, since
@@ -98,6 +98,9 @@ pub struct ModelCost {
     pub priority: Option<TierCost>,
     /// `None` means this model costs the same whatever the prompt size.
     pub long_context: Option<LongContext>,
+    /// Short- and long-lived cache-write multipliers of the selected tier's input
+    /// rate. `None` means writes cannot be priced, not that they are free.
+    pub cache_write_multipliers: Option<(f64, f64)>,
 }
 
 impl ModelCost {
@@ -113,7 +116,7 @@ impl ModelCost {
         };
         match service_tier {
             Some("flex") => flex.as_ref().unwrap_or(standard),
-            Some("priority") => priority.as_ref().unwrap_or(standard),
+            Some("priority" | "fast") => priority.as_ref().unwrap_or(standard),
             _ => standard,
         }
     }
@@ -133,6 +136,11 @@ impl ModelCost {
             cached_input,
             output,
         });
+        self
+    }
+
+    const fn cache_writes(mut self, short: f64, long: f64) -> Self {
+        self.cache_write_multipliers = Some((short, long));
         self
     }
 
@@ -180,7 +188,18 @@ const fn model(
         flex: None,
         priority: None,
         long_context: None,
+        cache_write_multipliers: None,
     }
+}
+
+/// Anthropic's cache-write multipliers are shared by all its models.
+const fn claude(
+    name: &'static str,
+    input: f64,
+    cached_input: Option<f64>,
+    output: f64,
+) -> ModelCost {
+    model(name, input, cached_input, output).cache_writes(1.25, 2.0)
 }
 
 /// The standard-tier rates above `above_prompt_tokens`. Chain `.flex()` and
@@ -217,37 +236,40 @@ pub const MODELS: &[ModelCost] = &[
     // Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
     // Checked 2026-10-08. Cache writes are 1.25x (5m) / 2x (1h) base input;
     // batch discounts stack with both reads and writes.
-    model("claude-opus-4.5", 5.0, Some(0.50), 25.0),
-    model("claude-opus-4-5", 5.0, Some(0.50), 25.0),
-    model("claude-opus-4.1", 15.0, Some(1.50), 75.0),
-    model("claude-opus-4-1", 15.0, Some(1.50), 75.0),
-    model("claude-opus-4", 15.0, Some(1.50), 75.0),
-    model("claude-sonnet-4.5", 3.0, Some(0.30), 15.0),
-    model("claude-sonnet-4-5", 3.0, Some(0.30), 15.0),
-    model("claude-sonnet-4", 3.0, Some(0.30), 15.0),
-    model("claude-haiku-4", 0.80, Some(0.08), 4.0),
-    model("claude-3-opus", 15.0, Some(1.50), 75.0),
-    model("claude-3-7-sonnet", 3.0, Some(0.30), 15.0),
-    model("claude-3-5-haiku", 0.80, Some(0.08), 4.0),
-    model("claude-fable-5", 10.0, Some(1.0), 50.0),
-    model("claude-mythos-5", 10.0, Some(1.0), 50.0),
-    model("claude-fable-5-1", 10.0, Some(0.25), 50.0),
-    model("claude-mythos-5-1", 10.0, Some(0.25), 50.0),
-    model("claude-opus-5-5", 4.0, Some(0.20), 20.0),
-    model("claude-opus-5", 5.0, Some(0.50), 25.0),
-    model("claude-opus-4-8", 5.0, Some(0.50), 25.0),
-    model("claude-opus-4-7", 5.0, Some(0.50), 25.0),
-    model("claude-opus-4-6", 5.0, Some(0.50), 25.0),
-    model("claude-sonnet-4-6", 3.0, Some(0.30), 15.0),
-    model("claude-sonnet-5-5", 2.0, Some(0.10), 10.0),
-    model("claude-sonnet-5", 2.0, Some(0.20), 10.0),
-    model("claude-haiku-5-5", 0.10, Some(0.01), 0.50).long_context(long(
+    claude("claude-opus-4.5", 5.0, Some(0.50), 25.0),
+    claude("claude-opus-4-5", 5.0, Some(0.50), 25.0),
+    claude("claude-opus-4.1", 15.0, Some(1.50), 75.0),
+    claude("claude-opus-4-1", 15.0, Some(1.50), 75.0),
+    claude("claude-opus-4", 15.0, Some(1.50), 75.0),
+    claude("claude-sonnet-4.5", 3.0, Some(0.30), 15.0),
+    claude("claude-sonnet-4-5", 3.0, Some(0.30), 15.0),
+    claude("claude-sonnet-4", 3.0, Some(0.30), 15.0),
+    claude("claude-haiku-4", 0.80, Some(0.08), 4.0),
+    claude("claude-3-opus", 15.0, Some(1.50), 75.0),
+    claude("claude-3-7-sonnet", 3.0, Some(0.30), 15.0),
+    claude("claude-3-5-haiku", 0.80, Some(0.08), 4.0),
+    claude("claude-fable-5", 10.0, Some(1.0), 50.0),
+    claude("claude-mythos-5", 10.0, Some(1.0), 50.0),
+    claude("claude-fable-5-1", 10.0, Some(0.25), 50.0),
+    claude("claude-mythos-5-1", 10.0, Some(0.25), 50.0),
+    // Opus 5.5: $4 input / $20 output / $0.20 cache hits; both ID spellings.
+    // https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-11-03)
+    claude("claude-opus-5.5", 4.0, Some(0.20), 20.0),
+    claude("claude-opus-5-5", 4.0, Some(0.20), 20.0),
+    claude("claude-opus-5", 5.0, Some(0.50), 25.0),
+    claude("claude-opus-4-8", 5.0, Some(0.50), 25.0),
+    claude("claude-opus-4-7", 5.0, Some(0.50), 25.0),
+    claude("claude-opus-4-6", 5.0, Some(0.50), 25.0),
+    claude("claude-sonnet-4-6", 3.0, Some(0.30), 15.0),
+    claude("claude-sonnet-5-5", 2.0, Some(0.10), 10.0),
+    claude("claude-sonnet-5", 2.0, Some(0.20), 10.0),
+    claude("claude-haiku-5-5", 0.10, Some(0.01), 0.50).long_context(long(
         100_000,
         0.50,
         Some(0.05),
         2.50,
     )),
-    model("claude-haiku-4-5", 1.0, Some(0.10), 5.0),
+    claude("claude-haiku-4-5", 1.0, Some(0.10), 5.0),
     // OpenAI
     // Copied from https://platform.openai.com/docs/pricing on 2026-03-17
     model("gpt-4.1", 2.00, Some(0.50), 8.00),
@@ -279,6 +301,12 @@ pub const MODELS: &[ModelCost] = &[
     //
     // Pro is the one Gemini family Google prices by prompt size: every column
     // roughly doubles above 200k.
+    // Introductory prices through 2026-11-30; every tier doubles on 2026-12-01.
+    // No prompt-length tiers; caching is implicit only.
+    // https://aistudio.google.com/docs/pricing (checked 2026-11-03)
+    model("gemini-4-argon", 2.00, Some(0.10), 10.00)
+        .flex(1.00, Some(0.05), 5.00)
+        .priority(3.60, Some(0.18), 18.00),
     model("gemini-3.1-pro", 2.00, Some(0.20), 12.00)
         .flex(1.00, Some(0.20), 6.00)
         .priority(3.60, Some(0.36), 21.60)
@@ -358,6 +386,7 @@ pub const MODELS: &[ModelCost] = &[
                 .priority(8.00, Some(0.80), 30.00),
         ),
     model("gpt-6-luna", 0.10, Some(0.01), 0.50)
+        .cache_writes(1.25, 2.0)
         .flex(0.05, Some(0.005), 0.25)
         .priority(0.20, Some(0.02), 1.00)
         .long_context(
@@ -392,8 +421,11 @@ pub const MODELS: &[ModelCost] = &[
                 .flex(4.00, Some(0.40), 15.00)
                 .priority(16.00, Some(1.60), 60.00),
         ),
-    // Cut 20% on 2026-07-30 (from 2.50/0.25/15.00); https://openai.com/pricing
+    // Standard, flex/batch and fast rates, including long context, checked
+    // 2026-11-03: https://developers.openai.com/api/docs/pricing
+    // Cache writes cost 1.25x (30m) / 2.5x (12h) the selected input rate.
     model("gpt-5.6-terra", 2.00, Some(0.20), 12.00)
+        .cache_writes(1.25, 2.5)
         .flex(1.00, Some(0.10), 6.00)
         .priority(4.00, Some(0.40), 24.00)
         .long_context(
@@ -452,7 +484,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-10-17-cache-write-audit";
+pub const RATE_CARD_VERSION: &str = "2026-11-03";
 
 /// The cost in dollars of a **single** request.
 ///
@@ -483,14 +515,6 @@ pub fn cost_of_call_split(
     {
         return None;
     }
-    if (tokens.cache_creation_5m > 0 || tokens.cache_creation_1h > 0)
-        && !model.starts_with("claude-")
-        && !model.starts_with("gpt-6-luna")
-    {
-        // Native Anthropic premiums and the supplied Luna rate card are known;
-        // other models' cache-write premiums have not been confirmed.
-        return None;
-    }
     if !matches!(
         service_tier,
         None | Some(
@@ -513,10 +537,14 @@ pub fn cost_of_call_split(
     let rates = model_cost.rates(service_tier, tokens.prompt);
     let (mut input, output) = rates.charge_split(uncached, cached, tokens.output);
     // Writes are already included at 1x in uncached input. Add only the
-    // premium: 5m writes are 1.25x, 1h writes 2x. Batch halves all rates.
-    input += rates.input
-        * (0.25 * tokens.cache_creation_5m as f64 + tokens.cache_creation_1h as f64)
-        / 1_000_000.0;
+    // model's premium, at the selected context/tier rate. Batch halves it too.
+    if tokens.cache_creation_5m > 0 || tokens.cache_creation_1h > 0 {
+        let (short, long) = model_cost.cache_write_multipliers?;
+        input += rates.input
+            * ((short - 1.0) * tokens.cache_creation_5m as f64
+                + (long - 1.0) * tokens.cache_creation_1h as f64)
+            / 1_000_000.0;
+    }
     let discount = if service_tier == Some("batch") {
         0.5
     } else {
@@ -577,13 +605,66 @@ mod tests {
             cost_of_call("gpt-6-luna", Some("batch"), tokens),
             Some(0.0000625)
         );
-        assert_eq!(cost_of_call("gpt-5.6-terra", Some("batch"), tokens), None);
+        for model in ["gpt-4o", "gpt-6-sol", "gemini-4-argon"] {
+            assert_eq!(cost_of_call(model, Some("batch"), tokens), None);
+            assert_eq!(
+                cost_of_call(
+                    model,
+                    None,
+                    CallTokens {
+                        cache_creation_1h: 1000,
+                        ..usage(1000, 0, 0)
+                    }
+                ),
+                None
+            );
+        }
         tokens.cached_prompt = 1;
         assert_eq!(cost_of_call("gpt-6-luna", Some("batch"), tokens), None);
         assert_eq!(
             cost_of_call("gpt-6-luna", Some("unknown-tier"), usage(100, 0, 0)),
             None
         );
+    }
+
+    #[test]
+    fn terra_write_prices_follow_tier_and_context() {
+        for (prompt, expected) in [(1000, 0.005), (300_000, 1.206)] {
+            let tokens = CallTokens {
+                cache_creation_1h: 1000,
+                ..usage(prompt, 0, 0)
+            };
+            // Short: 1000 * $5 / 1M. Long: (299000 * $4 + 1000 * $10) / 1M.
+            for (tier, multiplier) in [
+                ("default", 1.0),
+                ("batch", 0.5),
+                ("flex", 0.5),
+                ("fast", 2.0),
+            ] {
+                let cost = cost_of_call("gpt-5.6-terra", Some(tier), tokens).unwrap();
+                assert!((cost - expected * multiplier).abs() < 1e-12);
+            }
+        }
+        // Luna retains its existing 2x long-write behavior.
+        let tokens = CallTokens {
+            cache_creation_1h: 1000,
+            ..usage(1000, 0, 0)
+        };
+        assert_eq!(cost_of_call("gpt-6-luna", None, tokens), Some(0.0002));
+    }
+
+    #[test]
+    fn argon_prices_all_tiers_without_a_context_threshold() {
+        let tokens = usage(2_000_000, 1_000_000, 1_000_000);
+        for (tier, expected) in [
+            ("standard", 12.10),
+            ("batch", 6.05),
+            ("flex", 6.05),
+            ("priority", 21.78),
+        ] {
+            let cost = cost_of_call("gemini-4-argon", Some(tier), tokens).unwrap();
+            assert!((cost - expected).abs() < 1e-12);
+        }
     }
 
     #[test]
@@ -617,6 +698,8 @@ mod tests {
     #[test]
     fn dated_point_releases_resolve_to_the_point_release() {
         for (id, expected) in [
+            ("claude-opus-5-5-20260922", "claude-opus-5-5"),
+            ("claude-opus-5.5-20260922", "claude-opus-5.5"),
             ("claude-opus-4-5-20251101", "claude-opus-4-5"),
             ("claude-opus-4.5", "claude-opus-4.5"),
             ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
