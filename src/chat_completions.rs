@@ -147,6 +147,9 @@ pub struct ChatClient {
     /// Clients whose caches are checked in order after this client's cache. These clients are
     /// never allowed to make API requests through this client. Configure them newest-to-oldest.
     cache_fallbacks: Vec<ChatClient>,
+
+    /// Another client to try when a single request fails, after this client's retries.
+    failover: Option<Box<ChatClient>>,
 }
 
 /// The role of a message.
@@ -739,6 +742,14 @@ fn retry_delay(error: &ChatError, attempt: u32) -> Option<std::time::Duration> {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ChatError {
+    /// Both the primary request and its failover failed.
+    #[error("Primary request failed: {primary:?}; failover failed: {failover:?}")]
+    Failover {
+        /// The primary client's error.
+        primary: Box<ChatError>,
+        /// The failover client's error (possibly another failover failure).
+        failover: Box<ChatError>,
+    },
     /// A native provider returned a non-successful HTTP status.
     #[error("Provider HTTP {status}: {body}")]
     HttpStatus {
@@ -965,6 +976,7 @@ impl ChatClient {
             http_client: provider.http_client(),
             cached_only: false,
             cache_fallbacks: Vec::new(),
+            failover: None,
         }
     }
 
@@ -1077,6 +1089,16 @@ impl ChatClient {
     /// Multiple fallbacks are checked in the order they are added.
     pub fn with_cache_fallback(mut self, fallback: ChatClient) -> Self {
         self.cache_fallbacks.push(fallback);
+        self
+    }
+
+    /// Try another client when a single request fails, after normal retries,
+    /// including when its response cannot be decoded into the requested type.
+    /// Each client keeps its own settings, cache and usage accounting. Failovers
+    /// may themselves have failovers. Cached-only and measurement mode never
+    /// follow failovers; batch calls are unaffected, even when sent live.
+    pub fn with_failover(mut self, failover: ChatClient) -> Self {
+        self.failover = Some(Box::new(failover));
         self
     }
 
@@ -1282,6 +1304,46 @@ impl ChatClient {
 
     /// Send a sequence of chat messages to the API, then map the response to a different type. The response will only be cached if the mapping succeeds.
     async fn chat_with_messages_raw_mapped<T>(
+        &self,
+        messages: Vec<ChatMessage>,
+        response_format: ResponseFormat,
+        map_response: impl Fn(String) -> Result<T, ChatError>,
+    ) -> Result<T, ChatError> {
+        let mut client = self;
+        let mut failures = Vec::new();
+        loop {
+            let error = match client
+                .chat_with_messages_single_mapped(
+                    messages.clone(),
+                    response_format.clone(),
+                    &map_response,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) => error,
+            };
+            if !client.cached_only && !crate::measurement::enabled() {
+                if let Some(failover) = client.failover.as_deref() {
+                    warn!(
+                        "Chat request to {} failed ({error:?}); failing over to {}",
+                        client.model, failover.model
+                    );
+                    failures.push(error);
+                    client = failover;
+                    continue;
+                }
+            }
+            return Err(failures.into_iter().rev().fold(error, |failover, primary| {
+                ChatError::Failover {
+                    primary: Box::new(primary),
+                    failover: Box::new(failover),
+                }
+            }));
+        }
+    }
+
+    async fn chat_with_messages_single_mapped<T>(
         &self,
         messages: Vec<ChatMessage>,
         response_format: ResponseFormat,
@@ -2034,7 +2096,7 @@ impl ChatClient {
         let results: Vec<(usize, Result<T, IndividualChatError>)> = futures::stream::iter(misses)
             .map(|(index, request)| async move {
                 let result = self
-                    .chat_with_messages_raw_mapped(
+                    .chat_with_messages_single_mapped(
                         request.messages.clone(),
                         request.response_format.clone(),
                         mapped,

@@ -15,7 +15,11 @@ async fn measurement_blocks_live_and_batch_without_client_opt_in() {
     listener.set_nonblocking(true).unwrap();
     // Intentionally not .with_cached_only(): measurement itself must enforce it.
     let client = ChatClient::new("not-a-key", "gpt-4o")
-        .with_url(format!("http://{}/v1/", listener.local_addr().unwrap()));
+        .with_url(format!("http://{}/v1/", listener.local_addr().unwrap()))
+        .with_failover(
+            ChatClient::new("not-a-key", "gpt-6-sol")
+                .with_url(format!("http://{}/v1/", listener.local_addr().unwrap())),
+        );
     assert!(matches!(
         client.chat::<Answer>("live miss").await,
         Err(ChatError::CacheMiss)
