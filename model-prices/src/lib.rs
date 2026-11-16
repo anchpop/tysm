@@ -234,7 +234,7 @@ const GPT_5_LONG_CONTEXT: u32 = 272_000;
 /// visible as a missing `.flex()` rather than hidden in a second table.
 pub const MODELS: &[ModelCost] = &[
     // Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
-    // Checked 2026-10-08. Cache writes are 1.25x (5m) / 2x (1h) base input;
+    // Checked 2026-11-16. Cache writes are 1.25x (5m) / 2x (1h) base input;
     // batch discounts stack with both reads and writes.
     claude("claude-opus-4.5", 5.0, Some(0.50), 25.0),
     claude("claude-opus-4-5", 5.0, Some(0.50), 25.0),
@@ -252,6 +252,10 @@ pub const MODELS: &[ModelCost] = &[
     claude("claude-mythos-5", 10.0, Some(1.0), 50.0),
     claude("claude-fable-5-1", 10.0, Some(0.25), 50.0),
     claude("claude-mythos-5-1", 10.0, Some(0.25), 50.0),
+    // Fable / Mythos 5.2: $8 input / $40 output / $0.20 cache hits (0.025x).
+    // Without these, "claude-fable-5-2" prefix-matched "claude-fable-5".
+    claude("claude-fable-5-2", 8.0, Some(0.20), 40.0),
+    claude("claude-mythos-5-2", 8.0, Some(0.20), 40.0),
     // Opus 5.5: $4 input / $20 output / $0.20 cache hits; both ID spellings.
     // https://platform.claude.com/docs/en/about-claude/pricing (checked 2026-11-03)
     claude("claude-opus-5.5", 4.0, Some(0.20), 20.0),
@@ -484,7 +488,7 @@ pub fn price_of(model: &str) -> Option<&'static ModelCost> {
 /// Stamp it onto anything that records a dollar figure, so historical token
 /// counts can be repriced when a vendor moves its list prices. Bump it
 /// whenever a rate in [`MODELS`] changes.
-pub const RATE_CARD_VERSION: &str = "2026-11-03";
+pub const RATE_CARD_VERSION: &str = "2026-11-16";
 
 /// The cost in dollars of a **single** request.
 ///
