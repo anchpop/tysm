@@ -392,6 +392,8 @@ fn usage_and_pricing_include_both_cache_write_ttls_and_long_context() {
         ("claude-sonnet-5-5", 2.0, 0.10, 10.0),
         ("claude-opus-5-5", 4.0, 0.20, 20.0),
         ("claude-fable-5-1", 10.0, 0.25, 50.0),
+        ("claude-fable-5-2", 8.0, 0.20, 40.0),
+        ("claude-mythos-5-2-20261101", 8.0, 0.20, 40.0),
     ];
     for (model, input, read, output) in rates {
         let price = crate::model_prices::price_of(model).unwrap();
